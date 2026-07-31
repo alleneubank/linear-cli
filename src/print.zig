@@ -1,5 +1,5 @@
 const std = @import("std");
-const io = std.io;
+const Io = std.Io;
 
 pub const TableOptions = struct {
     pad: bool = true,
@@ -18,7 +18,27 @@ pub const ProjectField = enum { id, name, slug, description, state, start_date, 
 pub const project_default_fields = [_]ProjectField{ .id, .name, .state, .target_date };
 pub const project_field_count = std.meta.fields(ProjectField).len;
 
-pub fn printJson(value: std.json.Value, writer: *io.Writer, pretty: bool) !void {
+pub const LabelField = enum { id, name, color, description, team };
+pub const label_default_fields = [_]LabelField{ .id, .name, .color, .team };
+pub const label_field_count = std.meta.fields(LabelField).len;
+
+pub const UserField = enum { id, name, display_name, email, active };
+pub const user_default_fields = [_]UserField{ .id, .name, .display_name, .email };
+pub const user_field_count = std.meta.fields(UserField).len;
+
+pub const StateField = enum { id, name, type, position, team };
+pub const state_default_fields = [_]StateField{ .id, .name, .type, .position, .team };
+pub const state_field_count = std.meta.fields(StateField).len;
+
+pub const CommentField = enum { id, author, body, created_at, updated_at, parent, url };
+pub const comment_default_fields = [_]CommentField{ .id, .author, .created_at, .body };
+pub const comment_field_count = std.meta.fields(CommentField).len;
+
+pub const MilestoneField = enum { id, name, target_date, sort_order, description, project };
+pub const milestone_default_fields = [_]MilestoneField{ .id, .name, .target_date, .sort_order };
+pub const milestone_field_count = std.meta.fields(MilestoneField).len;
+
+pub fn printJson(value: std.json.Value, writer: *Io.Writer, pretty: bool) !void {
     var jw = std.json.Stringify{
         .writer = writer,
         .options = .{ .whitespace = if (pretty) .indent_2 else .minified },
@@ -27,7 +47,7 @@ pub fn printJson(value: std.json.Value, writer: *io.Writer, pretty: bool) !void 
     try writer.writeByte('\n');
 }
 
-pub fn printJsonFields(value: std.json.Value, writer: *io.Writer, pretty: bool, fields: []const []const u8) !void {
+pub fn printJsonFields(value: std.json.Value, writer: *Io.Writer, pretty: bool, fields: []const []const u8) !void {
     if (value != .object) return error.InvalidRoot;
 
     var jw = std.json.Stringify{
@@ -74,10 +94,55 @@ pub const ProjectRow = struct {
     url: []const u8,
 };
 
-pub const UserRow = struct {
+/// Single-row shape used by `linear me`; the multi-row `users list` table uses
+/// `UserRow` with its own field projection.
+pub const ViewerRow = struct {
     id: []const u8,
     name: []const u8,
     email: []const u8,
+};
+
+pub const LabelRow = struct {
+    id: []const u8,
+    name: []const u8,
+    color: []const u8,
+    description: []const u8,
+    team: []const u8,
+};
+
+pub const UserRow = struct {
+    id: []const u8,
+    name: []const u8,
+    display_name: []const u8,
+    email: []const u8,
+    active: []const u8,
+};
+
+pub const StateRow = struct {
+    id: []const u8,
+    name: []const u8,
+    type: []const u8,
+    position: []const u8,
+    team: []const u8,
+};
+
+pub const CommentRow = struct {
+    id: []const u8,
+    author: []const u8,
+    body: []const u8,
+    created_at: []const u8,
+    updated_at: []const u8,
+    parent: []const u8,
+    url: []const u8,
+};
+
+pub const MilestoneRow = struct {
+    id: []const u8,
+    name: []const u8,
+    target_date: []const u8,
+    sort_order: []const u8,
+    description: []const u8,
+    project: []const u8,
 };
 
 pub const KeyValue = struct {
@@ -193,7 +258,172 @@ pub fn printProjectTable(allocator: std.mem.Allocator, writer: anytype, rows: []
     }
 }
 
-pub fn printUserTable(allocator: std.mem.Allocator, writer: anytype, rows: []const UserRow, opts: TableOptions) !void {
+pub fn printLabelTable(allocator: std.mem.Allocator, writer: anytype, rows: []const LabelRow, fields: []const LabelField, opts: TableOptions) !void {
+    _ = allocator;
+    const selected = if (fields.len == 0) label_default_fields[0..] else fields;
+
+    var caps_buf: [label_field_count]usize = undefined;
+    var widths: [label_field_count]usize = undefined;
+    var header_row: [label_field_count][]const u8 = undefined;
+    var cell_row: [label_field_count][]const u8 = undefined;
+
+    for (selected, 0..) |field, idx| {
+        const cap = if (opts.truncate) labelFieldCap(field) else 0;
+        caps_buf[idx] = cap;
+        const header = labelFieldLabel(field);
+        header_row[idx] = header;
+        widths[idx] = displayWidth(header, cap);
+    }
+
+    for (rows) |row| {
+        fillLabelCells(row, selected, &cell_row);
+        for (selected, 0..) |_, idx| {
+            widths[idx] = @max(widths[idx], displayWidth(cell_row[idx], caps_buf[idx]));
+        }
+    }
+
+    const active_caps = caps_buf[0..selected.len];
+    const active_widths = widths[0..selected.len];
+    try writeRow(header_row[0..selected.len], active_widths, active_caps, opts, writer);
+    for (rows) |row| {
+        fillLabelCells(row, selected, &cell_row);
+        try writeRow(cell_row[0..selected.len], active_widths, active_caps, opts, writer);
+    }
+}
+
+pub fn printUserTable(allocator: std.mem.Allocator, writer: anytype, rows: []const UserRow, fields: []const UserField, opts: TableOptions) !void {
+    _ = allocator;
+    const selected = if (fields.len == 0) user_default_fields[0..] else fields;
+
+    var caps_buf: [user_field_count]usize = undefined;
+    var widths: [user_field_count]usize = undefined;
+    var header_row: [user_field_count][]const u8 = undefined;
+    var cell_row: [user_field_count][]const u8 = undefined;
+
+    for (selected, 0..) |field, idx| {
+        const cap = if (opts.truncate) userFieldCap(field) else 0;
+        caps_buf[idx] = cap;
+        const header = userFieldLabel(field);
+        header_row[idx] = header;
+        widths[idx] = displayWidth(header, cap);
+    }
+
+    for (rows) |row| {
+        fillUserCells(row, selected, &cell_row);
+        for (selected, 0..) |_, idx| {
+            widths[idx] = @max(widths[idx], displayWidth(cell_row[idx], caps_buf[idx]));
+        }
+    }
+
+    const active_caps = caps_buf[0..selected.len];
+    const active_widths = widths[0..selected.len];
+    try writeRow(header_row[0..selected.len], active_widths, active_caps, opts, writer);
+    for (rows) |row| {
+        fillUserCells(row, selected, &cell_row);
+        try writeRow(cell_row[0..selected.len], active_widths, active_caps, opts, writer);
+    }
+}
+
+pub fn printStateTable(allocator: std.mem.Allocator, writer: anytype, rows: []const StateRow, fields: []const StateField, opts: TableOptions) !void {
+    _ = allocator;
+    const selected = if (fields.len == 0) state_default_fields[0..] else fields;
+
+    var caps_buf: [state_field_count]usize = undefined;
+    var widths: [state_field_count]usize = undefined;
+    var header_row: [state_field_count][]const u8 = undefined;
+    var cell_row: [state_field_count][]const u8 = undefined;
+
+    for (selected, 0..) |field, idx| {
+        const cap = if (opts.truncate) stateFieldCap(field) else 0;
+        caps_buf[idx] = cap;
+        const header = stateFieldLabel(field);
+        header_row[idx] = header;
+        widths[idx] = displayWidth(header, cap);
+    }
+
+    for (rows) |row| {
+        fillStateCells(row, selected, &cell_row);
+        for (selected, 0..) |_, idx| {
+            widths[idx] = @max(widths[idx], displayWidth(cell_row[idx], caps_buf[idx]));
+        }
+    }
+
+    const active_caps = caps_buf[0..selected.len];
+    const active_widths = widths[0..selected.len];
+    try writeRow(header_row[0..selected.len], active_widths, active_caps, opts, writer);
+    for (rows) |row| {
+        fillStateCells(row, selected, &cell_row);
+        try writeRow(cell_row[0..selected.len], active_widths, active_caps, opts, writer);
+    }
+}
+
+pub fn printMilestoneTable(allocator: std.mem.Allocator, writer: anytype, rows: []const MilestoneRow, fields: []const MilestoneField, opts: TableOptions) !void {
+    _ = allocator;
+    const selected = if (fields.len == 0) milestone_default_fields[0..] else fields;
+
+    var caps_buf: [milestone_field_count]usize = undefined;
+    var widths: [milestone_field_count]usize = undefined;
+    var header_row: [milestone_field_count][]const u8 = undefined;
+    var cell_row: [milestone_field_count][]const u8 = undefined;
+
+    for (selected, 0..) |field, idx| {
+        const cap = if (opts.truncate) milestoneFieldCap(field) else 0;
+        caps_buf[idx] = cap;
+        const header = milestoneFieldLabel(field);
+        header_row[idx] = header;
+        widths[idx] = displayWidth(header, cap);
+    }
+
+    for (rows) |row| {
+        fillMilestoneCells(row, selected, &cell_row);
+        for (selected, 0..) |_, idx| {
+            widths[idx] = @max(widths[idx], displayWidth(cell_row[idx], caps_buf[idx]));
+        }
+    }
+
+    const active_caps = caps_buf[0..selected.len];
+    const active_widths = widths[0..selected.len];
+    try writeRow(header_row[0..selected.len], active_widths, active_caps, opts, writer);
+    for (rows) |row| {
+        fillMilestoneCells(row, selected, &cell_row);
+        try writeRow(cell_row[0..selected.len], active_widths, active_caps, opts, writer);
+    }
+}
+
+pub fn printCommentTable(allocator: std.mem.Allocator, writer: anytype, rows: []const CommentRow, fields: []const CommentField, opts: TableOptions) !void {
+    _ = allocator;
+    const selected = if (fields.len == 0) comment_default_fields[0..] else fields;
+
+    var caps_buf: [comment_field_count]usize = undefined;
+    var widths: [comment_field_count]usize = undefined;
+    var header_row: [comment_field_count][]const u8 = undefined;
+    var cell_row: [comment_field_count][]const u8 = undefined;
+
+    for (selected, 0..) |field, idx| {
+        const cap = if (opts.truncate) commentFieldCap(field) else 0;
+        caps_buf[idx] = cap;
+        const header = commentFieldLabel(field);
+        header_row[idx] = header;
+        widths[idx] = displayWidth(header, cap);
+    }
+
+    for (rows) |row| {
+        fillCommentCells(row, selected, &cell_row);
+        for (selected, 0..) |_, idx| {
+            widths[idx] = @max(widths[idx], displayWidth(cell_row[idx], caps_buf[idx]));
+        }
+    }
+
+    const active_caps = caps_buf[0..selected.len];
+    const active_widths = widths[0..selected.len];
+    try writeRow(header_row[0..selected.len], active_widths, active_caps, opts, writer);
+    for (rows) |row| {
+        fillCommentCells(row, selected, &cell_row);
+        try writeRow(cell_row[0..selected.len], active_widths, active_caps, opts, writer);
+    }
+}
+
+pub fn printViewerTable(allocator: std.mem.Allocator, writer: anytype, rows: []const ViewerRow, opts: TableOptions) !void {
     _ = allocator;
     const headers = [_][]const u8{ "ID", "Name", "Email" };
     const caps = [_]usize{ 0, 0, 0 };
@@ -232,9 +462,9 @@ pub fn printKeyValues(writer: anytype, pairs: []const KeyValue) !void {
     }
 }
 
-pub fn humanTime(allocator: std.mem.Allocator, iso: []const u8, now_override: ?i64) ![]u8 {
+pub fn humanTime(allocator: std.mem.Allocator, io: std.Io, iso: []const u8, now_override: ?i64) ![]u8 {
     const ts = try parseIso8601Seconds(iso);
-    const now = now_override orelse std.time.timestamp();
+    const now = now_override orelse std.Io.Clock.real.now(io).toSeconds();
     const diff = now - ts;
     const in_future = diff < 0;
     if (diff == std.math.minInt(i64)) return error.InvalidTimestamp;
@@ -432,6 +662,175 @@ fn fillProjectCells(row: ProjectRow, fields: []const ProjectField, buffer: *[pro
             .state => row.state,
             .start_date => row.start_date,
             .target_date => row.target_date,
+            .url => row.url,
+        };
+    }
+}
+
+fn labelFieldLabel(field: LabelField) []const u8 {
+    return switch (field) {
+        .id => "ID",
+        .name => "Name",
+        .color => "Color",
+        .description => "Description",
+        .team => "Team",
+    };
+}
+
+fn labelFieldCap(field: LabelField) usize {
+    return switch (field) {
+        .id => 0,
+        .name => 32,
+        .color => 9,
+        .description => 48,
+        .team => 8,
+    };
+}
+
+fn fillLabelCells(row: LabelRow, fields: []const LabelField, buffer: *[label_field_count][]const u8) void {
+    for (fields, 0..) |field, idx| {
+        buffer[idx] = switch (field) {
+            .id => row.id,
+            .name => row.name,
+            .color => row.color,
+            .description => row.description,
+            .team => row.team,
+        };
+    }
+}
+
+fn userFieldLabel(field: UserField) []const u8 {
+    return switch (field) {
+        .id => "ID",
+        .name => "Name",
+        .display_name => "Display Name",
+        .email => "Email",
+        .active => "Active",
+    };
+}
+
+fn userFieldCap(field: UserField) usize {
+    return switch (field) {
+        .id => 0,
+        .name => 32,
+        .display_name => 24,
+        .email => 40,
+        .active => 6,
+    };
+}
+
+fn fillUserCells(row: UserRow, fields: []const UserField, buffer: *[user_field_count][]const u8) void {
+    for (fields, 0..) |field, idx| {
+        buffer[idx] = switch (field) {
+            .id => row.id,
+            .name => row.name,
+            .display_name => row.display_name,
+            .email => row.email,
+            .active => row.active,
+        };
+    }
+}
+
+fn stateFieldLabel(field: StateField) []const u8 {
+    return switch (field) {
+        .id => "ID",
+        .name => "Name",
+        .type => "Type",
+        .position => "Position",
+        .team => "Team",
+    };
+}
+
+fn stateFieldCap(field: StateField) usize {
+    return switch (field) {
+        .id => 0,
+        .name => 32,
+        .type => 12,
+        .position => 10,
+        .team => 8,
+    };
+}
+
+fn fillStateCells(row: StateRow, fields: []const StateField, buffer: *[state_field_count][]const u8) void {
+    for (fields, 0..) |field, idx| {
+        buffer[idx] = switch (field) {
+            .id => row.id,
+            .name => row.name,
+            .type => row.type,
+            .position => row.position,
+            .team => row.team,
+        };
+    }
+}
+
+fn milestoneFieldLabel(field: MilestoneField) []const u8 {
+    return switch (field) {
+        .id => "ID",
+        .name => "Name",
+        .target_date => "Target",
+        .sort_order => "Sort",
+        .description => "Description",
+        .project => "Project",
+    };
+}
+
+fn milestoneFieldCap(field: MilestoneField) usize {
+    return switch (field) {
+        .id => 0,
+        .name => 32,
+        .target_date => 12,
+        .sort_order => 8,
+        .description => 48,
+        .project => 24,
+    };
+}
+
+fn fillMilestoneCells(row: MilestoneRow, fields: []const MilestoneField, buffer: *[milestone_field_count][]const u8) void {
+    for (fields, 0..) |field, idx| {
+        buffer[idx] = switch (field) {
+            .id => row.id,
+            .name => row.name,
+            .target_date => row.target_date,
+            .sort_order => row.sort_order,
+            .description => row.description,
+            .project => row.project,
+        };
+    }
+}
+
+fn commentFieldLabel(field: CommentField) []const u8 {
+    return switch (field) {
+        .id => "ID",
+        .author => "Author",
+        .body => "Body",
+        .created_at => "Created",
+        .updated_at => "Updated",
+        .parent => "Parent",
+        .url => "URL",
+    };
+}
+
+fn commentFieldCap(field: CommentField) usize {
+    return switch (field) {
+        .id => 0,
+        .author => 20,
+        .body => 60,
+        .created_at => 25,
+        .updated_at => 25,
+        .parent => 0,
+        .url => 48,
+    };
+}
+
+fn fillCommentCells(row: CommentRow, fields: []const CommentField, buffer: *[comment_field_count][]const u8) void {
+    for (fields, 0..) |field, idx| {
+        buffer[idx] = switch (field) {
+            .id => row.id,
+            .author => row.author,
+            .body => row.body,
+            .created_at => row.created_at,
+            .updated_at => row.updated_at,
+            .parent => row.parent,
             .url => row.url,
         };
     }

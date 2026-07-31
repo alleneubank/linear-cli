@@ -99,7 +99,7 @@ pub fn parseGlobal(args: [][]const u8) !Parsed {
 }
 
 pub fn stripTrailingGlobals(allocator: std.mem.Allocator, args: []const []const u8, opts: *GlobalOptions) ![][]const u8 {
-    var filtered = std.ArrayListUnmanaged([]const u8){};
+    var filtered = std.ArrayListUnmanaged([]const u8).empty;
     errdefer filtered.deinit(allocator);
 
     var idx: usize = 0;

@@ -5,6 +5,88 @@ const Allocator = std.mem.Allocator;
 
 pub const CommandError = error{CommandFailed};
 
+/// Upper bound for `--*-file` content flags. Linear rejects far larger bodies
+/// anyway, so this exists to turn a runaway file or an unterminated stdin pipe
+/// into a clear diagnostic instead of an unbounded allocation.
+pub const max_content_bytes: usize = 1024 * 1024;
+
+/// Value every `--*-file` flag accepts to mean "read stdin instead of a path".
+pub const stdin_marker = "-";
+
+pub const ResolvedContent = struct {
+    value: ?[]const u8 = null,
+    owned: bool = false,
+
+    pub fn deinit(self: ResolvedContent, allocator: Allocator) void {
+        if (!self.owned) return;
+        if (self.value) |value| allocator.free(value);
+    }
+};
+
+/// Collapses a `--<flag>` / `--<flag>-file` pair into a single value.
+///
+/// Supplying both is an error rather than a silent precedence rule, so a
+/// mistyped invocation can never quietly send the wrong content. Returns a
+/// null value when neither flag was given; callers decide whether that is
+/// allowed.
+pub fn resolveContent(
+    allocator: Allocator,
+    io: std.Io,
+    text: ?[]const u8,
+    path: ?[]const u8,
+    stderr: anytype,
+    prefix: []const u8,
+    flag: []const u8,
+) !ResolvedContent {
+    if (text != null and path != null) {
+        try stderr.print("{s}: cannot use both {s} and {s}-file\n", .{ prefix, flag, flag });
+        return CommandError.CommandFailed;
+    }
+    if (text) |value| return .{ .value = value };
+    const file_path = path orelse return .{};
+    return .{ .value = try readContentFile(allocator, io, file_path, stderr, prefix), .owned = true };
+}
+
+/// Reads long-form content for a `--*-file` flag; `stdin_marker` reads stdin.
+/// Caller owns the returned bytes.
+pub fn readContentFile(
+    allocator: Allocator,
+    io: std.Io,
+    path: []const u8,
+    stderr: anytype,
+    prefix: []const u8,
+) ![]u8 {
+    if (std.mem.eql(u8, path, stdin_marker)) return readContentStdin(allocator, io, stderr, prefix);
+
+    // The limit is exclusive, so read one byte past the cap: a file of exactly
+    // `max_content_bytes` is accepted and anything larger trips StreamTooLong.
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(max_content_bytes + 1)) catch |err| {
+        switch (err) {
+            error.StreamTooLong => try stderr.print(
+                "{s}: file '{s}' exceeds the {d} byte limit\n",
+                .{ prefix, path, max_content_bytes },
+            ),
+            else => try stderr.print("{s}: cannot read file '{s}': {s}\n", .{ prefix, path, @errorName(err) }),
+        }
+        return CommandError.CommandFailed;
+    };
+}
+
+fn readContentStdin(allocator: Allocator, io: std.Io, stderr: anytype, prefix: []const u8) ![]u8 {
+    var stdin_buf: [4096]u8 = undefined;
+    var stdin_reader = std.Io.File.stdin().readerStreaming(io, &stdin_buf);
+    return stdin_reader.interface.allocRemaining(allocator, .limited(max_content_bytes + 1)) catch |err| {
+        switch (err) {
+            error.StreamTooLong => try stderr.print(
+                "{s}: stdin exceeds the {d} byte limit\n",
+                .{ prefix, max_content_bytes },
+            ),
+            else => try stderr.print("{s}: cannot read from stdin: {s}\n", .{ prefix, @errorName(err) }),
+        }
+        return CommandError.CommandFailed;
+    };
+}
+
 pub fn requireApiKey(cfg: *config.Config, override_key: ?[]const u8, stderr: anytype, prefix: []const u8) ![]const u8 {
     const key = cfg.resolveApiKey(override_key) catch {
         try stderr.print("{s}: missing API key; set LINEAR_API_KEY or run 'linear auth set'\n", .{prefix});
@@ -14,6 +96,7 @@ pub fn requireApiKey(cfg: *config.Config, override_key: ?[]const u8, stderr: any
 }
 
 pub fn checkResponse(
+    io: std.Io,
     prefix: []const u8,
     resp: *const graphql.GraphqlClient.Response,
     stderr: anytype,
@@ -36,7 +119,7 @@ pub fn checkResponse(
                 try stderr.print("{s}: unauthorized; verify LINEAR_API_KEY or run 'linear auth set'\n", .{prefix});
             }
         }
-        try printRateLimit(prefix, resp.rate_limit, stderr);
+        try printRateLimit(io, prefix, resp.rate_limit, stderr);
         return CommandError.CommandFailed;
     }
 
@@ -46,7 +129,7 @@ pub fn checkResponse(
         } else {
             try stderr.print("{s}: GraphQL errors present\n", .{prefix});
         }
-        try printRateLimit(prefix, resp.rate_limit, stderr);
+        try printRateLimit(io, prefix, resp.rate_limit, stderr);
         return CommandError.CommandFailed;
     }
 }
@@ -100,7 +183,7 @@ pub fn send(
     };
 }
 
-fn printRateLimit(prefix: []const u8, info: graphql.GraphqlClient.RateLimitInfo, stderr: anytype) !void {
+fn printRateLimit(io: std.Io, prefix: []const u8, info: graphql.GraphqlClient.RateLimitInfo, stderr: anytype) !void {
     if (!info.hasData()) return;
     try stderr.print("{s}: rate limit:", .{prefix});
 
@@ -122,7 +205,7 @@ fn printRateLimit(prefix: []const u8, info: graphql.GraphqlClient.RateLimitInfo,
     }
 
     if (info.reset_epoch_ms) |reset_ms| {
-        const now_ms_i64: i64 = std.time.milliTimestamp();
+        const now_ms_i64: i64 = std.Io.Clock.real.now(io).toMilliseconds();
         const now_ms: u64 = if (now_ms_i64 > 0) @intCast(now_ms_i64) else 0;
         if (reset_ms > now_ms) {
             try stderr.print("{s} reset in ~{d}ms", .{ if (emitted) ";" else "", reset_ms - now_ms });
@@ -158,7 +241,7 @@ pub fn resolveViewerId(
     };
     defer response.deinit();
 
-    checkResponse(prefix, &response, stderr, client.api_key) catch {
+    checkResponse(client.io, prefix, &response, stderr, client.api_key) catch {
         return CommandError.CommandFailed;
     };
 
@@ -220,21 +303,21 @@ pub fn resolveIssueId(
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var filter: std.json.Value = .{ .object = std.json.ObjectMap.init(var_alloc) };
+    var filter: std.json.Value = .{ .object = std.json.ObjectMap.empty };
 
-    var team_obj: std.json.Value = .{ .object = std.json.ObjectMap.init(var_alloc) };
-    var key_cmp: std.json.Value = .{ .object = std.json.ObjectMap.init(var_alloc) };
-    try key_cmp.object.put("eq", .{ .string = team_key });
-    try team_obj.object.put("key", key_cmp);
-    try filter.object.put("team", team_obj);
+    var team_obj: std.json.Value = .{ .object = std.json.ObjectMap.empty };
+    var key_cmp: std.json.Value = .{ .object = std.json.ObjectMap.empty };
+    try key_cmp.object.put(var_alloc, "eq", .{ .string = team_key });
+    try team_obj.object.put(var_alloc, "key", key_cmp);
+    try filter.object.put(var_alloc, "team", team_obj);
 
-    var number_cmp: std.json.Value = .{ .object = std.json.ObjectMap.init(var_alloc) };
-    try number_cmp.object.put("eq", .{ .integer = number_i64 });
-    try filter.object.put("number", number_cmp);
+    var number_cmp: std.json.Value = .{ .object = std.json.ObjectMap.empty };
+    try number_cmp.object.put(var_alloc, "eq", .{ .integer = number_i64 });
+    try filter.object.put(var_alloc, "number", number_cmp);
 
-    var variables: std.json.Value = .{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("filter", filter);
-    try variables.object.put("first", .{ .integer = 1 });
+    var variables: std.json.Value = .{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "filter", filter);
+    try variables.object.put(var_alloc, "first", .{ .integer = 1 });
 
     const query =
         \\query IssueLookup($filter: IssueFilter!, $first: Int!) {
@@ -253,7 +336,7 @@ pub fn resolveIssueId(
     };
     defer response.deinit();
 
-    checkResponse(prefix, &response, stderr, client.api_key) catch {
+    checkResponse(client.io, prefix, &response, stderr, client.api_key) catch {
         return CommandError.CommandFailed;
     };
 
@@ -305,14 +388,14 @@ pub fn resolveProjectId(
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var filter: std.json.Value = .{ .object = std.json.ObjectMap.init(var_alloc) };
-    var slug_obj: std.json.Value = .{ .object = std.json.ObjectMap.init(var_alloc) };
-    try slug_obj.object.put("eq", .{ .string = identifier });
-    try filter.object.put("slugId", slug_obj);
+    var filter: std.json.Value = .{ .object = std.json.ObjectMap.empty };
+    var slug_obj: std.json.Value = .{ .object = std.json.ObjectMap.empty };
+    try slug_obj.object.put(var_alloc, "eq", .{ .string = identifier });
+    try filter.object.put(var_alloc, "slugId", slug_obj);
 
-    var variables: std.json.Value = .{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("filter", filter);
-    try variables.object.put("first", .{ .integer = 1 });
+    var variables: std.json.Value = .{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "filter", filter);
+    try variables.object.put(var_alloc, "first", .{ .integer = 1 });
 
     const query =
         \\query ProjectLookup($filter: ProjectFilter!, $first: Int!) {
@@ -331,7 +414,7 @@ pub fn resolveProjectId(
     };
     defer response.deinit();
 
-    checkResponse(prefix, &response, stderr, client.api_key) catch {
+    checkResponse(client.io, prefix, &response, stderr, client.api_key) catch {
         return CommandError.CommandFailed;
     };
 
@@ -390,7 +473,7 @@ pub fn resolveProjectStatusId(
     };
     defer response.deinit();
 
-    checkResponse(prefix, &response, stderr, client.api_key) catch {
+    checkResponse(client.io, prefix, &response, stderr, client.api_key) catch {
         return CommandError.CommandFailed;
     };
 
@@ -465,14 +548,16 @@ fn isUuid(value: []const u8) bool {
     return true;
 }
 
+/// Below this length the first-4/last-4 hint would expose half or more of the
+/// secret, so those keys are replaced wholesale.
+pub const min_redactable_key_len = 16;
+
 pub fn redactKey(key: []const u8, buffer: []u8) []const u8 {
-    if (buffer.len == 0 or key.len == 0) return "<redacted>";
-    const head_len: usize = @min(key.len, 4);
-    const tail_len: usize = if (key.len > head_len) @min(key.len - head_len, 4) else 0;
+    if (buffer.len == 0 or key.len < min_redactable_key_len) return "<redacted>";
 
     return std.fmt.bufPrint(buffer, "{s}...{s}", .{
-        key[0..head_len],
-        if (tail_len > 0) key[key.len - tail_len ..] else "",
+        key[0..4],
+        key[key.len - 4 ..],
     }) catch "<redacted>";
 }
 
@@ -490,20 +575,23 @@ test "checkResponse reports auth errors and redacts key" {
         .status = 401,
         .parsed = parsed,
     };
-    var buffer = std.ArrayList(u8).init(allocator);
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
     defer buffer.deinit();
 
+    const fake_key = "abcdefghijklmnop1234";
     try std.testing.expectError(
         CommandError.CommandFailed,
-        checkResponse("issues", &resp, buffer.writer(), "abcd1234"),
+        checkResponse(std.testing.io, "issues", &resp, &buffer.writer, fake_key),
     );
-    const output = buffer.items;
+    const output = buffer.written();
     try std.testing.expect(std.mem.indexOf(u8, output, "HTTP status 401") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "abcd...1234") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, fake_key) == null);
 }
 
-test "redactKey falls back for short inputs" {
-    var buf: [8]u8 = undefined;
-    const value = redactKey("k", &buf);
-    try std.testing.expectEqualStrings("k...k", value);
+test "redactKey hides short inputs entirely" {
+    var buf: [16]u8 = undefined;
+    try std.testing.expectEqualStrings("<redacted>", redactKey("k", &buf));
+    try std.testing.expectEqualStrings("<redacted>", redactKey("abcd1234", &buf));
+    try std.testing.expectEqualStrings("abcd...3456", redactKey("abcdefghij123456", &buf));
 }

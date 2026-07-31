@@ -4,20 +4,26 @@ const graphql = @import("graphql");
 const printer = @import("printer");
 const common = @import("common");
 const download = @import("download");
+const git = @import("git");
 
 const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
     retries: u8,
     timeout_ms: u32,
     endpoint: ?[]const u8 = null,
+    /// `null` disables branch inference for a missing identifier, and with it
+    /// every subprocess this command could start. `main.zig` installs
+    /// `git.system_runner`; tests inject a fake.
+    git_runner: ?git.Runner = null,
 };
 
-const Options = struct {
+pub const Options = struct {
     identifier: ?[]const u8 = null,
     help: bool = false,
     quiet: bool = false,
@@ -26,15 +32,21 @@ const Options = struct {
     fields: ?[]const u8 = null,
     sub_limit: usize = 10,
     comment_limit: usize = 10,
-    attachment_dir: ?[]const u8 = "/tmp",
+    /// Opt-in: a read command must not write attacker-influenced filenames into
+    /// a shared directory by default.
+    attachment_dir: ?[]const u8 = null,
 };
+
+/// Downloaded attachments may carry private issue content, so they are created
+/// owner-only rather than at the process umask default.
+const attachment_file_mode = 0o600;
 
 const Field = enum { identifier, title, state, assignee, priority, url, created_at, updated_at, description, project, milestone, parent, sub_issues, comments };
 const default_fields = [_]Field{ .identifier, .title, .state, .assignee, .priority, .url, .created_at, .updated_at, .description };
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseOptions(ctx.args) catch |err| {
         try stderr.print("issue view: {s}\n", .{@errorName(err)});
@@ -44,27 +56,35 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try usage(&out_writer.interface);
         return 0;
     }
 
-    const target = opts.identifier orelse {
-        try stderr.print("issue view: missing identifier or id\n", .{});
-        return 1;
+    var inferred: ?[]u8 = null;
+    defer if (inferred) |value| ctx.allocator.free(value);
+    const target = opts.identifier orelse blk: {
+        const runner = ctx.git_runner orelse {
+            try stderr.print("issue view: missing identifier or id\n", .{});
+            return 1;
+        };
+        inferred = git.requireInferredIdentifier(runner, ctx.allocator, ctx.io, stderr, "issue view") catch {
+            return 1;
+        };
+        break :blk inferred.?;
     };
 
     const api_key = common.requireApiKey(ctx.config, null, stderr, "issue view") catch {
         return 1;
     };
 
-    var owned_times = std.ArrayListUnmanaged([]u8){};
+    var owned_times = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (owned_times.items) |value| ctx.allocator.free(value);
         owned_times.deinit(ctx.allocator);
     }
 
-    var fields_buf = std.ArrayListUnmanaged(Field){};
+    var fields_buf = std.ArrayListUnmanaged(Field).empty;
     defer fields_buf.deinit(ctx.allocator);
     const selected_fields = parseFields(opts.fields, &fields_buf, ctx.allocator) catch |err| {
         const message = switch (err) {
@@ -84,18 +104,18 @@ pub fn run(ctx: Context) !u8 {
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("id", .{ .string = target });
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "id", .{ .string = target });
     if (include_subs) {
         const sub_limit_i64 = std.math.cast(i64, opts.sub_limit) orelse return error.InvalidLimit;
-        try variables.object.put("subLimit", .{ .integer = sub_limit_i64 });
+        try variables.object.put(var_alloc, "subLimit", .{ .integer = sub_limit_i64 });
     }
     if (include_comments) {
         const comment_limit_i64 = std.math.cast(i64, opts.comment_limit) orelse return error.InvalidLimit;
-        try variables.object.put("commentLimit", .{ .integer = comment_limit_i64 });
+        try variables.object.put(var_alloc, "commentLimit", .{ .integer = comment_limit_i64 });
     }
 
-    var query_builder = std.ArrayListUnmanaged(u8){};
+    var query_builder = std.ArrayListUnmanaged(u8).empty;
     defer query_builder.deinit(ctx.allocator);
     try query_builder.appendSlice(ctx.allocator, "query IssueView($id: String!");
     if (include_subs) try query_builder.appendSlice(ctx.allocator, ", $subLimit: Int!");
@@ -112,7 +132,7 @@ pub fn run(ctx: Context) !u8 {
     try query_builder.appendSlice(ctx.allocator, "  }\n}\n");
     const query = query_builder.items;
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -127,7 +147,7 @@ pub fn run(ctx: Context) !u8 {
     };
     defer response.deinit();
 
-    common.checkResponse("issue view", &response, stderr, api_key) catch {
+    common.checkResponse(ctx.io, "issue view", &response, stderr, api_key) catch {
         return 1;
     };
 
@@ -163,7 +183,7 @@ pub fn run(ctx: Context) !u8 {
         const subs_obj = common.getObjectField(node, "children") orelse common.getObjectField(node, "subIssues");
         if (subs_obj) |subs| {
             if (common.getArrayField(subs, "nodes")) |sub_nodes| {
-                var joined = std.ArrayListUnmanaged(u8){};
+                var joined = std.ArrayListUnmanaged(u8).empty;
                 defer joined.deinit(ctx.allocator);
                 for (sub_nodes.items, 0..) |sub, idx| {
                     if (sub != .object) continue;
@@ -188,7 +208,7 @@ pub fn run(ctx: Context) !u8 {
         author: []const u8,
         created_at: []const u8,
     };
-    var comments_list = std.ArrayListUnmanaged(CommentData){};
+    var comments_list = std.ArrayListUnmanaged(CommentData).empty;
     defer comments_list.deinit(ctx.allocator);
     var comment_truncated = false;
     if (include_comments) {
@@ -226,7 +246,7 @@ pub fn run(ctx: Context) !u8 {
     else
         null;
     const created = if (opts.human_time) blk: {
-        const formatted = printer.humanTime(ctx.allocator, created_raw, null) catch null;
+        const formatted = printer.humanTime(ctx.allocator, ctx.io, created_raw, null) catch null;
         if (formatted) |value| {
             try owned_times.append(ctx.allocator, value);
             break :blk value;
@@ -234,7 +254,7 @@ pub fn run(ctx: Context) !u8 {
         break :blk created_raw;
     } else created_raw;
     const updated = if (opts.human_time) blk: {
-        const formatted = printer.humanTime(ctx.allocator, updated_raw, null) catch null;
+        const formatted = printer.humanTime(ctx.allocator, ctx.io, updated_raw, null) catch null;
         if (formatted) |value| {
             try owned_times.append(ctx.allocator, value);
             break :blk value;
@@ -245,7 +265,7 @@ pub fn run(ctx: Context) !u8 {
     if (opts.attachment_dir) |attachment_dir| {
         if (description) |desc| {
             if (desc.len > 0) {
-                downloadAttachments(ctx.allocator, api_key, desc, attachment_dir, ctx.timeout_ms, stderr);
+                downloadAttachments(ctx.allocator, ctx.io, api_key, desc, attachment_dir, ctx.timeout_ms, stderr);
             }
         }
     }
@@ -282,9 +302,9 @@ pub fn run(ctx: Context) !u8 {
         .sub_issue_identifiers = sub_display,
     };
 
-    var display_pairs = std.ArrayListUnmanaged(printer.KeyValue){};
+    var display_pairs = std.ArrayListUnmanaged(printer.KeyValue).empty;
     defer display_pairs.deinit(ctx.allocator);
-    var data_pairs = std.ArrayListUnmanaged(printer.KeyValue){};
+    var data_pairs = std.ArrayListUnmanaged(printer.KeyValue).empty;
     defer data_pairs.deinit(ctx.allocator);
 
     for (selected_fields) |field| {
@@ -355,11 +375,11 @@ pub fn run(ctx: Context) !u8 {
             .comments => {
                 // Comments are handled separately in JSON output; for display, format inline
                 if (comments_list.items.len > 0) {
-                    var comments_display = std.ArrayListUnmanaged(u8){};
+                    var comments_display = std.ArrayListUnmanaged(u8).empty;
                     defer comments_display.deinit(ctx.allocator);
                     for (comments_list.items, 0..) |c, idx| {
                         if (idx > 0) try comments_display.appendSlice(ctx.allocator, "\n---\n");
-                        try comments_display.writer(ctx.allocator).print("[{s}] {s}:\n{s}", .{ c.created_at, c.author, c.body });
+                        try comments_display.print(ctx.allocator, "[{s}] {s}:\n{s}", .{ c.created_at, c.author, c.body });
                     }
                     if (comments_display.items.len > 0) {
                         const owned = try comments_display.toOwnedSlice(ctx.allocator);
@@ -367,7 +387,7 @@ pub fn run(ctx: Context) !u8 {
                         try appendPair(&display_pairs, ctx.allocator, "Comments", owned);
                     }
                     // For data_pairs, use JSON array format for unambiguous parsing
-                    var json_buffer = std.io.Writer.Allocating.init(ctx.allocator);
+                    var json_buffer = std.Io.Writer.Allocating.init(ctx.allocator);
                     defer json_buffer.deinit();
                     var jw = std.json.Stringify{
                         .writer = &json_buffer.writer,
@@ -395,7 +415,7 @@ pub fn run(ctx: Context) !u8 {
     }
 
     var stdout_buf: [0]u8 = undefined;
-    var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+    var stdout_writer = std.Io.File.stdout().writer(ctx.io, &stdout_buf);
     var stdout_iface = &stdout_writer.interface;
 
     if (opts.quiet) {
@@ -412,22 +432,22 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.data_only) {
         if (ctx.json_output) {
-            var data_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+            var data_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
             for (data_pairs.items) |pair| {
-                try data_obj.object.put(pair.key, .{ .string = pair.value });
+                try data_obj.object.put(var_alloc, pair.key, .{ .string = pair.value });
             }
             // Add comments as array if requested (always emit array, even if empty)
             if (include_comments) {
                 var comments_arr = std.json.Array.init(var_alloc);
                 for (comments_list.items) |c| {
-                    var comment_obj = std.json.ObjectMap.init(var_alloc);
-                    try comment_obj.put("id", .{ .string = c.id });
-                    try comment_obj.put("body", .{ .string = c.body });
-                    try comment_obj.put("author", .{ .string = c.author });
-                    try comment_obj.put("created_at", .{ .string = c.created_at });
+                    var comment_obj = std.json.ObjectMap.empty;
+                    try comment_obj.put(var_alloc, "id", .{ .string = c.id });
+                    try comment_obj.put(var_alloc, "body", .{ .string = c.body });
+                    try comment_obj.put(var_alloc, "author", .{ .string = c.author });
+                    try comment_obj.put(var_alloc, "created_at", .{ .string = c.created_at });
                     try comments_arr.append(.{ .object = comment_obj });
                 }
-                try data_obj.object.put("comments", .{ .array = comments_arr });
+                try data_obj.object.put(var_alloc, "comments", .{ .array = comments_arr });
             }
             try printer.printJson(data_obj, stdout_iface, true);
             if (sub_truncated) {
@@ -452,25 +472,25 @@ pub fn run(ctx: Context) !u8 {
     if (ctx.json_output) {
         if (opts.fields == null) {
             var out_buf2: [0]u8 = undefined;
-            var out_writer = std.fs.File.stdout().writer(&out_buf2);
+            var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf2);
             try printer.printJson(data_value, &out_writer.interface, true);
         } else {
-            var data_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+            var data_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
             for (data_pairs.items) |pair| {
-                try data_obj.object.put(pair.key, .{ .string = pair.value });
+                try data_obj.object.put(var_alloc, pair.key, .{ .string = pair.value });
             }
             // Add comments as array if requested (always emit array, even if empty)
             if (include_comments) {
                 var comments_arr = std.json.Array.init(var_alloc);
                 for (comments_list.items) |c| {
-                    var comment_obj = std.json.ObjectMap.init(var_alloc);
-                    try comment_obj.put("id", .{ .string = c.id });
-                    try comment_obj.put("body", .{ .string = c.body });
-                    try comment_obj.put("author", .{ .string = c.author });
-                    try comment_obj.put("created_at", .{ .string = c.created_at });
+                    var comment_obj = std.json.ObjectMap.empty;
+                    try comment_obj.put(var_alloc, "id", .{ .string = c.id });
+                    try comment_obj.put(var_alloc, "body", .{ .string = c.body });
+                    try comment_obj.put(var_alloc, "author", .{ .string = c.author });
+                    try comment_obj.put(var_alloc, "created_at", .{ .string = c.created_at });
                     try comments_arr.append(.{ .object = comment_obj });
                 }
-                try data_obj.object.put("comments", .{ .array = comments_arr });
+                try data_obj.object.put(var_alloc, "comments", .{ .array = comments_arr });
             }
             try printer.printJson(data_obj, stdout_iface, true);
         }
@@ -495,7 +515,7 @@ pub fn run(ctx: Context) !u8 {
     return 0;
 }
 
-fn parseOptions(args: [][]const u8) !Options {
+pub fn parseOptions(args: [][]const u8) !Options {
     var opts = Options{};
     var idx: usize = 0;
     while (idx < args.len) {
@@ -625,7 +645,8 @@ fn appendPair(list: *std.ArrayListUnmanaged(printer.KeyValue), allocator: Alloca
 
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear issue view <ID|IDENTIFIER> [--quiet] [--data-only] [--fields LIST] [--human-time] [--sub-limit N] [--comment-limit N] [--attachment-dir DIR] [--help]
+        \\Usage: linear issue view [ID|IDENTIFIER] [--quiet] [--data-only] [--fields LIST] [--human-time] [--sub-limit N] [--comment-limit N] [--attachment-dir DIR] [--help]
+        \\Without an identifier the issue is inferred from the current branch name.
         \\Flags:
         \\  --quiet           Print only the identifier
         \\  --data-only       Emit tab-separated fields without formatting (or JSON object with --json)
@@ -633,7 +654,7 @@ pub fn usage(writer: anytype) !void {
         \\  --human-time      Render timestamps as relative values
         \\  --sub-limit N     Sub-issues to fetch when sub_issues field is requested (0 disables; default: 10)
         \\  --comment-limit N Comments to fetch when comments field is requested (0 disables; default: 10)
-        \\  --attachment-dir DIR Download uploads.linear.app attachments to DIR (default: /tmp, use "" to disable)
+        \\  --attachment-dir DIR Download uploads.linear.app attachments from the description into DIR (files are created 0600; disabled unless set)
         \\  --help            Show this help message
         \\Examples:
         \\  linear issue view ENG-123
@@ -645,11 +666,12 @@ pub fn usage(writer: anytype) !void {
 
 fn downloadAttachments(
     allocator: Allocator,
+    io: std.Io,
     api_key: []const u8,
     description: []const u8,
     attachment_dir: []const u8,
     timeout_ms: u32,
-    stderr: *std.io.Writer,
+    stderr: *std.Io.Writer,
 ) void {
     var urls = extractUploadUrls(allocator, description) catch |err| {
         stderr.print("issue view: failed to scan attachments: {s}\n", .{@errorName(err)}) catch {};
@@ -658,7 +680,7 @@ fn downloadAttachments(
     defer urls.deinit(allocator);
     if (urls.items.len == 0) return;
 
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
 
     for (urls.items) |url| {
@@ -672,15 +694,18 @@ fn downloadAttachments(
         };
         defer allocator.free(output_path);
 
-        var file = std.fs.cwd().createFile(output_path, .{ .truncate = true }) catch |err| {
+        const file = std.Io.Dir.cwd().createFile(io, output_path, .{
+            .truncate = true,
+            .permissions = .fromMode(attachment_file_mode),
+        }) catch |err| {
             stderr.print("issue view: failed to create {s}: {s}\n", .{ output_path, @errorName(err) }) catch {};
             continue;
         };
-        defer file.close();
+        defer file.close(io);
 
         var status_code: u16 = 0;
         var file_buf: [0]u8 = undefined;
-        var file_writer = file.writer(&file_buf);
+        var file_writer = file.writer(io, &file_buf);
         download.downloadWithClient(allocator, &client, api_key, url, &file_writer.interface, timeout_ms, &status_code) catch |err| {
             reportAttachmentError(stderr, api_key, url, err, status_code, timeout_ms);
             continue;
@@ -691,7 +716,7 @@ fn downloadAttachments(
 }
 
 fn extractUploadUrls(allocator: Allocator, text: []const u8) !std.ArrayListUnmanaged([]const u8) {
-    var matches = std.ArrayListUnmanaged([]const u8){};
+    var matches = std.ArrayListUnmanaged([]const u8).empty;
     var idx: usize = 0;
     while (idx < text.len) {
         const start = std.mem.indexOfPos(u8, text, idx, download.upload_prefix) orelse break;
@@ -714,7 +739,7 @@ fn isUrlTerminator(byte: u8) bool {
 }
 
 fn reportAttachmentError(
-    stderr: *std.io.Writer,
+    stderr: *std.Io.Writer,
     api_key: []const u8,
     url: []const u8,
     err: download.DownloadError,

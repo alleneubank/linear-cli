@@ -1,0 +1,5 @@
+ID       Name         Type       Position  Team
+state-1  Backlog      backlog    0         ENG 
+state-2  Todo         unstarted  1         ENG 
+state-3  In Progress  started    2.5       ENG 
+state-4  Done         completed  3         ENG 

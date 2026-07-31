@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
@@ -20,6 +21,10 @@ const Options = struct {
     identifier: ?[]const u8 = null,
     name: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    content: ?[]const u8 = null,
+    content_file: ?[]const u8 = null,
+    start_date: ?[]const u8 = null,
+    target_date: ?[]const u8 = null,
     state: ?[]const u8 = null,
     yes: bool = false,
     help: bool = false,
@@ -29,7 +34,7 @@ const Options = struct {
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseOptions(ctx.args) catch |err| {
         try stderr.print("project update: {s}\n", .{@errorName(err)});
@@ -39,7 +44,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try usage(&out_writer.interface);
         return 0;
     }
@@ -49,16 +54,34 @@ pub fn run(ctx: Context) !u8 {
         return 1;
     };
 
-    if (opts.name == null and opts.description == null and opts.state == null) {
+    if (opts.name == null and opts.description == null and opts.content == null and
+        opts.content_file == null and opts.start_date == null and opts.target_date == null and
+        opts.state == null)
+    {
         try stderr.print("project update: at least one field to update is required\n", .{});
         return 1;
     }
+
+    // Resolved before any network work so a bad path or an oversize file fails
+    // without touching the API.
+    const content_source = common.resolveContent(
+        ctx.allocator,
+        ctx.io,
+        opts.content,
+        opts.content_file,
+        stderr,
+        "project update",
+        "--content",
+    ) catch {
+        return 1;
+    };
+    defer content_source.deinit(ctx.allocator);
 
     const api_key = common.requireApiKey(ctx.config, null, stderr, "project update") catch {
         return 1;
     };
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -76,19 +99,24 @@ pub fn run(ctx: Context) !u8 {
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var input = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    if (opts.name) |name_value| try input.object.put("name", .{ .string = name_value });
-    if (opts.description) |desc| try input.object.put("description", .{ .string = desc });
+    var input = std.json.Value{ .object = std.json.ObjectMap.empty };
+    if (opts.name) |name_value| try input.object.put(var_alloc, "name", .{ .string = name_value });
+    if (opts.description) |desc| try input.object.put(var_alloc, "description", .{ .string = desc });
+    // `description` is capped at 255 characters by Linear; long-form project
+    // text belongs in the separate `content` field.
+    if (content_source.value) |content_value| try input.object.put(var_alloc, "content", .{ .string = content_value });
+    if (opts.start_date) |start_value| try input.object.put(var_alloc, "startDate", .{ .string = start_value });
+    if (opts.target_date) |target_value| try input.object.put(var_alloc, "targetDate", .{ .string = target_value });
     if (opts.state) |state_value| {
         status_id = common.resolveProjectStatusId(ctx.allocator, &client, state_value, stderr, "project update") catch {
             return 1;
         };
     }
-    if (status_id) |sid| try input.object.put("statusId", .{ .string = sid });
+    if (status_id) |sid| try input.object.put(var_alloc, "statusId", .{ .string = sid });
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("id", .{ .string = resolved.value });
-    try variables.object.put("input", input);
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "id", .{ .string = resolved.value });
+    try variables.object.put(var_alloc, "input", input);
 
     if (!opts.yes) {
         try stderr.print("project update: confirmation required; re-run with --yes to proceed\n", .{});
@@ -113,7 +141,7 @@ pub fn run(ctx: Context) !u8 {
     };
     defer response.deinit();
 
-    common.checkResponse("project update", &response, stderr, api_key) catch {
+    common.checkResponse(ctx.io, "project update", &response, stderr, api_key) catch {
         return 1;
     };
 
@@ -154,7 +182,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (ctx.json_output and !opts.quiet and !opts.data_only) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printJson(data_value, &out_writer.interface, true);
         return 0;
     }
@@ -167,9 +195,9 @@ pub fn run(ctx: Context) !u8 {
 
     const quiet_value = if (slug.len > 0) slug else id;
 
-    var display_pairs = std.ArrayListUnmanaged(printer.KeyValue){};
+    var display_pairs = std.ArrayListUnmanaged(printer.KeyValue).empty;
     defer display_pairs.deinit(ctx.allocator);
-    var data_pairs = std.ArrayListUnmanaged(printer.KeyValue){};
+    var data_pairs = std.ArrayListUnmanaged(printer.KeyValue).empty;
     defer data_pairs.deinit(ctx.allocator);
 
     try display_pairs.append(ctx.allocator, .{ .key = "ID", .value = id });
@@ -185,7 +213,7 @@ pub fn run(ctx: Context) !u8 {
     try data_pairs.append(ctx.allocator, .{ .key = "url", .value = url });
 
     var out_buf: [0]u8 = undefined;
-    var out_writer = std.fs.File.stdout().writer(&out_buf);
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     var stdout_iface = &out_writer.interface;
 
     if (opts.quiet) {
@@ -196,9 +224,9 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.data_only) {
         if (ctx.json_output) {
-            var data_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+            var data_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
             for (data_pairs.items) |pair| {
-                try data_obj.object.put(pair.key, .{ .string = pair.value });
+                try data_obj.object.put(var_alloc, pair.key, .{ .string = pair.value });
             }
             try printer.printJson(data_obj, stdout_iface, true);
             return 0;
@@ -254,6 +282,50 @@ pub fn parseOptions(args: [][]const u8) !Options {
             idx += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--content")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.content = args[idx + 1];
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--content=")) {
+            opts.content = arg["--content=".len..];
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--content-file")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.content_file = args[idx + 1];
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--content-file=")) {
+            opts.content_file = arg["--content-file=".len..];
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--start-date")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.start_date = args[idx + 1];
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--start-date=")) {
+            opts.start_date = arg["--start-date=".len..];
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--target-date")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.target_date = args[idx + 1];
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--target-date=")) {
+            opts.target_date = arg["--target-date=".len..];
+            idx += 1;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--state")) {
             if (idx + 1 >= args.len) return error.MissingValue;
             opts.state = args[idx + 1];
@@ -283,10 +355,14 @@ pub fn parseOptions(args: [][]const u8) !Options {
 
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear project update <ID> [--name NAME] [--description TEXT] [--state STATE] [--yes] [--quiet] [--data-only] [--help]
+        \\Usage: linear project update <ID> [--name NAME] [--description TEXT] [--content TEXT|--content-file PATH] [--start-date DATE] [--target-date DATE] [--state STATE] [--yes] [--quiet] [--data-only] [--help]
         \\Flags:
         \\  --name NAME         Update project name
-        \\  --description TEXT  Update description
+        \\  --description TEXT  Update description (Linear caps this at 255 characters)
+        \\  --content TEXT      Update long-form project content (no 255-character cap)
+        \\  --content-file PATH Read the project content from a file (use '-' for stdin)
+        \\  --start-date DATE   ISO start date
+        \\  --target-date DATE  ISO target date
         \\  --state STATE       Update state (backlog, planned, started, paused, completed, canceled)
         \\  --yes               Skip confirmation prompt (alias: --force)
         \\  --quiet             Print only the identifier
@@ -295,6 +371,7 @@ pub fn usage(writer: anytype) !void {
         \\Examples:
         \\  linear project update a6e7e3aa-53d0-42ab-9049-ac7aaa51f732 --name "New Name" --yes
         \\  linear project update 0949c8955675 --state started --yes --json
+        \\  linear project update 0949c8955675 --content-file overview.md --target-date 2026-12-31 --yes
         \\
     , .{});
 }

@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
@@ -32,7 +33,7 @@ const default_fields = [_]SearchField{ .title, .description };
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseOptions(ctx.args) catch |err| {
         const message = switch (err) {
@@ -49,7 +50,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try usage(&out_writer.interface);
         return 0;
     }
@@ -70,7 +71,7 @@ pub fn run(ctx: Context) !u8 {
         return 1;
     };
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -80,7 +81,7 @@ pub fn run(ctx: Context) !u8 {
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var fields_buf = std.ArrayListUnmanaged(SearchField){};
+    var fields_buf = std.ArrayListUnmanaged(SearchField).empty;
     defer fields_buf.deinit(ctx.allocator);
     const selected_fields = parseFields(opts.fields, &fields_buf, ctx.allocator) catch |err| {
         const message = switch (err) {
@@ -148,7 +149,7 @@ pub fn run(ctx: Context) !u8 {
     };
     defer response.deinit();
 
-    common.checkResponse("search", &response, stderr, api_key) catch {
+    common.checkResponse(ctx.io, "search", &response, stderr, api_key) catch {
         return 1;
     };
 
@@ -176,10 +177,10 @@ pub fn run(ctx: Context) !u8 {
 
     if (ctx.json_output) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printJson(data_value, &out_writer.interface, true);
     } else {
-        var rows = std.ArrayListUnmanaged(printer.IssueRow){};
+        var rows = std.ArrayListUnmanaged(printer.IssueRow).empty;
         defer rows.deinit(ctx.allocator);
         for (nodes_array.items) |node| {
             if (node != .object) continue;
@@ -209,7 +210,7 @@ pub fn run(ctx: Context) !u8 {
         }
 
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printIssueTable(ctx.allocator, &out_writer.interface, rows.items, printer.issue_default_fields[0..], .{});
     }
 
@@ -236,10 +237,10 @@ fn buildVariables(
     if (opts.limit == 0) return error.InvalidLimit;
     const limit_i64 = std.math.cast(i64, opts.limit) orelse return error.InvalidLimit;
 
-    var vars = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-    try vars.object.put("first", .{ .integer = limit_i64 });
+    var vars = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try vars.object.put(allocator, "first", .{ .integer = limit_i64 });
 
-    var filter = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    var filter = std.json.Value{ .object = std.json.ObjectMap.empty };
 
     const comparator = if (opts.case_sensitive) "contains" else "containsIgnoreCase";
     var clauses = std.json.Array.init(allocator);
@@ -249,60 +250,60 @@ fn buildVariables(
 
     // If query looks like an identifier (e.g., "SEND-53"), also match by issue number
     if (parseIdentifierNumber(query_value)) |issue_number| {
-        var num_cmp = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try num_cmp.object.put("eq", .{ .integer = issue_number });
-        var num_entry = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try num_entry.object.put("number", num_cmp);
+        var num_cmp = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try num_cmp.object.put(allocator, "eq", .{ .integer = issue_number });
+        var num_entry = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try num_entry.object.put(allocator, "number", num_cmp);
         try clauses.append(num_entry);
     }
 
     if (clauses.items.len == 0) return error.InvalidField;
-    try filter.object.put("or", .{ .array = clauses });
+    try filter.object.put(allocator, "or", .{ .array = clauses });
 
     const trimmed_team = std.mem.trim(u8, team_value, " \t");
     if (trimmed_team.len > 0) {
-        var eq_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try eq_obj.object.put("eq", .{ .string = trimmed_team });
+        var eq_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try eq_obj.object.put(allocator, "eq", .{ .string = trimmed_team });
 
-        var team_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+        var team_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
         if (isUuid(trimmed_team)) {
-            try team_obj.object.put("id", eq_obj);
+            try team_obj.object.put(allocator, "id", eq_obj);
         } else {
-            try team_obj.object.put("key", eq_obj);
+            try team_obj.object.put(allocator, "key", eq_obj);
         }
-        try filter.object.put("team", team_obj);
+        try filter.object.put(allocator, "team", team_obj);
     }
 
-    var state_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    var state_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
     if (opts.state_type) |state_raw| {
         const state_values = parseCsvValues(allocator, state_raw) catch |err| switch (err) {
             error.EmptyList => return error.InvalidStateFilter,
             else => return err,
         };
-        var state_type_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try state_type_obj.object.put("in", .{ .array = state_values });
-        try state_obj.object.put("type", state_type_obj);
+        var state_type_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try state_type_obj.object.put(allocator, "in", .{ .array = state_values });
+        try state_obj.object.put(allocator, "type", state_type_obj);
     } else {
         var state_values = std.json.Array.init(allocator);
         for (default_state_filter) |entry| {
             try state_values.append(.{ .string = entry });
         }
-        var state_type_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try state_type_obj.object.put("nin", .{ .array = state_values });
-        try state_obj.object.put("type", state_type_obj);
+        var state_type_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try state_type_obj.object.put(allocator, "nin", .{ .array = state_values });
+        try state_obj.object.put(allocator, "type", state_type_obj);
     }
-    try filter.object.put("state", state_obj);
+    try filter.object.put(allocator, "state", state_obj);
 
     if (assignee) |assignee_value| {
-        var eq_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try eq_obj.object.put("eq", .{ .string = assignee_value });
+        var eq_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try eq_obj.object.put(allocator, "eq", .{ .string = assignee_value });
 
-        var assignee_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try assignee_obj.object.put("id", eq_obj);
-        try filter.object.put("assignee", assignee_obj);
+        var assignee_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try assignee_obj.object.put(allocator, "id", eq_obj);
+        try filter.object.put(allocator, "assignee", assignee_obj);
     }
 
-    try vars.object.put("filter", filter);
+    try vars.object.put(allocator, "filter", filter);
     return vars;
 }
 
@@ -315,31 +316,31 @@ fn appendClause(
 ) !void {
     switch (field) {
         .title => {
-            var cmp = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-            try cmp.object.put(comparator, .{ .string = query_value });
-            var entry = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-            try entry.object.put("title", cmp);
+            var cmp = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try cmp.object.put(allocator, comparator, .{ .string = query_value });
+            var entry = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try entry.object.put(allocator, "title", cmp);
             try clauses.append(entry);
         },
         .description => {
-            var cmp = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-            try cmp.object.put(comparator, .{ .string = query_value });
-            var entry = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-            try entry.object.put("description", cmp);
+            var cmp = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try cmp.object.put(allocator, comparator, .{ .string = query_value });
+            var entry = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try entry.object.put(allocator, "description", cmp);
             try clauses.append(entry);
         },
         .comments => {
-            var body_cmp = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-            try body_cmp.object.put(comparator, .{ .string = query_value });
+            var body_cmp = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try body_cmp.object.put(allocator, comparator, .{ .string = query_value });
 
-            var comment_filter = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-            try comment_filter.object.put("body", body_cmp);
+            var comment_filter = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try comment_filter.object.put(allocator, "body", body_cmp);
 
-            var comments_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-            try comments_obj.object.put("some", comment_filter);
+            var comments_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try comments_obj.object.put(allocator, "some", comment_filter);
 
-            var entry = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-            try entry.object.put("comments", comments_obj);
+            var entry = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try entry.object.put(allocator, "comments", comments_obj);
             try clauses.append(entry);
         },
     }
@@ -433,7 +434,7 @@ fn resolveCurrentUserId(ctx: Context, client: *graphql.GraphqlClient, allocator:
     };
     defer response.deinit();
 
-    common.checkResponse("search", &response, stderr, client.api_key) catch {
+    common.checkResponse(ctx.io, "search", &response, stderr, client.api_key) catch {
         return error.ResolveFailed;
     };
 

@@ -1,0 +1,40 @@
+{
+  "data": {
+    "issue": {
+      "id": "issue-1",
+      "identifier": "ENG-123",
+      "comments": {
+        "nodes": [
+          {
+            "id": "comment-1",
+            "body": "First comment",
+            "createdAt": "2024-01-01T00:00:00.000Z",
+            "updatedAt": "2024-01-01T00:00:00.000Z",
+            "url": "https://linear.app/acme/issue/ENG-123#comment-1",
+            "user": { "name": "Ada Lovelace" },
+            "parent": null
+          },
+          {
+            "id": "comment-2",
+            "body": "Reply with\ntwo lines",
+            "createdAt": "2024-01-02T00:00:00.000Z",
+            "updatedAt": "2024-01-02T09:30:00.000Z",
+            "url": "https://linear.app/acme/issue/ENG-123#comment-2",
+            "user": { "name": "Grace Hopper" },
+            "parent": { "id": "comment-1" }
+          },
+          {
+            "id": "comment-3",
+            "body": "Third",
+            "createdAt": "2024-01-03T00:00:00.000Z",
+            "updatedAt": "2024-01-03T00:00:00.000Z",
+            "url": "https://linear.app/acme/issue/ENG-123#comment-3",
+            "user": null,
+            "parent": null
+          }
+        ],
+        "pageInfo": { "hasNextPage": false, "endCursor": "cursor-comment-3" }
+      }
+    }
+  }
+}

@@ -3,17 +3,23 @@ const config = @import("config");
 const graphql = @import("graphql");
 const printer = @import("printer");
 const common = @import("common");
+const git = @import("git");
 
 const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
     retries: u8,
     timeout_ms: u32,
     endpoint: ?[]const u8 = null,
+    /// `null` disables branch inference for a missing identifier, and with it
+    /// every subprocess this command could start. `main.zig` installs
+    /// `git.system_runner`; tests inject a fake.
+    git_runner: ?git.Runner = null,
 };
 
 const Options = struct {
@@ -24,6 +30,7 @@ const Options = struct {
     priority: ?i64 = null,
     title: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    description_file: ?[]const u8 = null,
     project: ?[]const u8 = null,
     yes: bool = false,
     help: bool = false,
@@ -33,7 +40,7 @@ const Options = struct {
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseOptions(ctx.args) catch |err| {
         try stderr.print("issue update: {s}\n", .{@errorName(err)});
@@ -43,27 +50,50 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try usage(&out_writer.interface);
         return 0;
     }
 
-    const target = opts.identifier orelse {
-        try stderr.print("issue update: missing identifier or id\n", .{});
-        return 1;
+    var inferred: ?[]u8 = null;
+    defer if (inferred) |value| ctx.allocator.free(value);
+    const target = opts.identifier orelse blk: {
+        const runner = ctx.git_runner orelse {
+            try stderr.print("issue update: missing identifier or id\n", .{});
+            return 1;
+        };
+        inferred = git.requireInferredIdentifier(runner, ctx.allocator, ctx.io, stderr, "issue update") catch {
+            return 1;
+        };
+        break :blk inferred.?;
     };
 
     // Require at least one field to update
-    if (opts.assignee == null and opts.parent == null and opts.state == null and opts.priority == null and opts.title == null and opts.project == null and opts.description == null) {
+    if (opts.assignee == null and opts.parent == null and opts.state == null and opts.priority == null and opts.title == null and opts.project == null and opts.description == null and opts.description_file == null) {
         try stderr.print("issue update: at least one field to update is required\n", .{});
         return 1;
     }
+
+    // Resolved before any network work so a bad path or an oversize file fails
+    // without touching the API.
+    const description_source = common.resolveContent(
+        ctx.allocator,
+        ctx.io,
+        opts.description,
+        opts.description_file,
+        stderr,
+        "issue update",
+        "--description",
+    ) catch {
+        return 1;
+    };
+    defer description_source.deinit(ctx.allocator);
 
     const api_key = common.requireApiKey(ctx.config, null, stderr, "issue update") catch {
         return 1;
     };
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -93,32 +123,44 @@ pub fn run(ctx: Context) !u8 {
         };
     }
 
-    var input = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    if (assignee_id) |aid| {
-        try input.object.put("assigneeId", .{ .string = aid });
-    }
-    if (opts.parent) |parent_id| {
-        try input.object.put("parentId", .{ .string = parent_id });
-    }
-    if (state_id) |state_value| {
-        try input.object.put("stateId", .{ .string = state_value });
-    }
-    if (opts.priority) |prio| {
-        try input.object.put("priority", .{ .integer = prio });
-    }
-    if (opts.title) |title_value| {
-        try input.object.put("title", .{ .string = title_value });
-    }
-    if (opts.description) |desc| {
-        try input.object.put("description", .{ .string = desc });
-    }
-    if (opts.project) |project_id| {
-        try input.object.put("projectId", .{ .string = project_id });
+    // `parentId` is a raw issue id, so a human identifier such as ENG-100 has to
+    // be looked up first; `resolveIssueId` passes real ids straight through.
+    var parent_resolved: ?common.ResolvedId = null;
+    defer if (parent_resolved) |resolved| {
+        if (resolved.owned) ctx.allocator.free(resolved.value);
+    };
+    if (opts.parent) |parent_value| {
+        parent_resolved = common.resolveIssueId(ctx.allocator, &client, parent_value, stderr, "issue update") catch {
+            return 1;
+        };
     }
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("id", .{ .string = target });
-    try variables.object.put("input", input);
+    var input = std.json.Value{ .object = std.json.ObjectMap.empty };
+    if (assignee_id) |aid| {
+        try input.object.put(var_alloc, "assigneeId", .{ .string = aid });
+    }
+    if (parent_resolved) |resolved| {
+        try input.object.put(var_alloc, "parentId", .{ .string = resolved.value });
+    }
+    if (state_id) |state_value| {
+        try input.object.put(var_alloc, "stateId", .{ .string = state_value });
+    }
+    if (opts.priority) |prio| {
+        try input.object.put(var_alloc, "priority", .{ .integer = prio });
+    }
+    if (opts.title) |title_value| {
+        try input.object.put(var_alloc, "title", .{ .string = title_value });
+    }
+    if (description_source.value) |desc| {
+        try input.object.put(var_alloc, "description", .{ .string = desc });
+    }
+    if (opts.project) |project_id| {
+        try input.object.put(var_alloc, "projectId", .{ .string = project_id });
+    }
+
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "id", .{ .string = target });
+    try variables.object.put(var_alloc, "input", input);
 
     if (!opts.yes) {
         try stderr.print("issue update: confirmation required; re-run with --yes to proceed\n", .{});
@@ -152,7 +194,7 @@ pub fn run(ctx: Context) !u8 {
     };
     defer response.deinit();
 
-    common.checkResponse("issue update", &response, stderr, api_key) catch {
+    common.checkResponse(ctx.io, "issue update", &response, stderr, api_key) catch {
         return 1;
     };
 
@@ -194,7 +236,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (ctx.json_output and !opts.quiet and !opts.data_only) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printJson(data_value, &out_writer.interface, true);
         return 0;
     }
@@ -212,7 +254,7 @@ pub fn run(ctx: Context) !u8 {
     const project_name = if (project_obj) |p| common.getStringField(p, "name") else null;
 
     var out_buf: [0]u8 = undefined;
-    var out_writer = std.fs.File.stdout().writer(&out_buf);
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     var stdout_iface = &out_writer.interface;
 
     if (opts.quiet) {
@@ -221,9 +263,9 @@ pub fn run(ctx: Context) !u8 {
         return 0;
     }
 
-    var pairs = std.ArrayListUnmanaged(printer.KeyValue){};
+    var pairs = std.ArrayListUnmanaged(printer.KeyValue).empty;
     defer pairs.deinit(ctx.allocator);
-    var data_pairs = std.ArrayListUnmanaged(printer.KeyValue){};
+    var data_pairs = std.ArrayListUnmanaged(printer.KeyValue).empty;
     defer data_pairs.deinit(ctx.allocator);
 
     try pairs.append(ctx.allocator, .{ .key = "Identifier", .value = identifier });
@@ -251,9 +293,9 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.data_only) {
         if (ctx.json_output) {
-            var data_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+            var data_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
             for (data_pairs.items) |pair| {
-                try data_obj.object.put(pair.key, .{ .string = pair.value });
+                try data_obj.object.put(var_alloc, pair.key, .{ .string = pair.value });
             }
             try printer.printJson(data_obj, stdout_iface, true);
             return 0;
@@ -279,7 +321,7 @@ fn resolveCurrentUserId(ctx: Context, client: *graphql.GraphqlClient, allocator:
     };
     defer response.deinit();
 
-    common.checkResponse("issue update", &response, stderr, client.api_key) catch {
+    common.checkResponse(ctx.io, "issue update", &response, stderr, client.api_key) catch {
         return error.ResolveFailed;
     };
 
@@ -309,8 +351,8 @@ fn resolveWorkflowStateId(
         return trimmed;
     }
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-    try variables.object.put("id", .{ .string = issue_identifier });
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(allocator, "id", .{ .string = issue_identifier });
 
     const query =
         \\query IssueStateLookup($id: String!) {
@@ -333,7 +375,7 @@ fn resolveWorkflowStateId(
     };
     defer response.deinit();
 
-    common.checkResponse("issue update", &response, stderr, client.api_key) catch {
+    common.checkResponse(ctx.io, "issue update", &response, stderr, client.api_key) catch {
         return common.CommandError.CommandFailed;
     };
 
@@ -362,7 +404,7 @@ fn resolveWorkflowStateId(
         return common.CommandError.CommandFailed;
     }
 
-    var available = std.ArrayListUnmanaged(u8){};
+    var available = std.ArrayListUnmanaged(u8).empty;
     defer available.deinit(ctx.allocator);
     var first = true;
 
@@ -489,6 +531,17 @@ pub fn parseOptions(args: []const []const u8) !Options {
             idx += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--description-file")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.description_file = args[idx + 1];
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--description-file=")) {
+            opts.description_file = arg["--description-file=".len..];
+            idx += 1;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--project")) {
             if (idx + 1 >= args.len) return error.MissingValue;
             opts.project = args[idx + 1];
@@ -518,14 +571,16 @@ pub fn parseOptions(args: []const []const u8) !Options {
 
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear issue update <ID|IDENTIFIER> [--assignee USER_ID|me] [--parent ISSUE_ID] [--state STATE_ID|NAME] [--priority N] [--title TEXT] [--description TEXT] [--project PROJECT_ID] [--yes] [--quiet] [--data-only] [--help]
+        \\Usage: linear issue update [ID|IDENTIFIER] [--assignee USER_ID|me] [--parent ID|IDENTIFIER] [--state STATE_ID|NAME] [--priority N] [--title TEXT] [--description TEXT|--description-file PATH] [--project PROJECT_ID] [--yes] [--quiet] [--data-only] [--help]
+        \\Without an identifier the issue is inferred from the current branch name.
         \\Flags:
         \\  --assignee USER_ID|me  Assign to user (use 'me' for current user)
-        \\  --parent ISSUE_ID      Set parent issue (make sub-issue)
+        \\  --parent ID|IDENTIFIER Set parent issue (make sub-issue); accepts ENG-100 or an issue id
         \\  --state STATE_ID|NAME  Change workflow state
         \\  --priority N           Set priority (0-4)
         \\  --title TEXT           Update title
         \\  --description TEXT     Update description
+        \\  --description-file PATH  Read the description from a file (use '-' for stdin)
         \\  --project PROJECT_ID   Attach to project
         \\  --yes                  Skip confirmation prompt (alias: --force)
         \\  --quiet                Print only the identifier
@@ -535,6 +590,7 @@ pub fn usage(writer: anytype) !void {
         \\  linear issue update ENG-123 --assignee me --yes
         \\  linear issue update ENG-123 --parent ENG-100 --yes
         \\  linear issue update ENG-123 --priority 1 --state done --yes
+        \\  linear issue update ENG-123 --description-file body.md --yes
         \\
     , .{});
 }

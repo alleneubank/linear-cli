@@ -1,5 +1,6 @@
 const std = @import("std");
 const posix = std.posix;
+const test_io = std.testing.io;
 const config = @import("config");
 const graphql = @import("graphql");
 const common = @import("common");
@@ -34,14 +35,14 @@ const Env = struct {
 };
 
 fn loadEnv(allocator: Allocator) Env {
-    const gate = std.process.getEnvVarOwned(allocator, "LINEAR_ONLINE_TESTS") catch null;
+    const gate = std.testing.environ.getAlloc(allocator, "LINEAR_ONLINE_TESTS") catch null;
     if (gate) |value| allocator.free(value);
     if (gate == null) return .{ .enabled = false };
 
-    const api_key = std.process.getEnvVarOwned(allocator, "LINEAR_API_KEY") catch null;
+    const api_key = std.testing.environ.getAlloc(allocator, "LINEAR_API_KEY") catch null;
     if (api_key == null) return .{ .enabled = false };
 
-    const allow_env = std.process.getEnvVarOwned(allocator, "LINEAR_TEST_ALLOW_MUTATIONS") catch null;
+    const allow_env = std.testing.environ.getAlloc(allocator, "LINEAR_TEST_ALLOW_MUTATIONS") catch null;
     const allow_mutations = allow_env != null;
     if (allow_env) |value| allocator.free(value);
 
@@ -50,16 +51,16 @@ fn loadEnv(allocator: Allocator) Env {
         .api_key = api_key,
         .allow_mutations = allow_mutations,
     };
-    env.team_id = std.process.getEnvVarOwned(allocator, "LINEAR_TEST_TEAM_ID") catch null;
-    env.issue_id = std.process.getEnvVarOwned(allocator, "LINEAR_TEST_ISSUE_ID") catch null;
-    env.project_id = std.process.getEnvVarOwned(allocator, "LINEAR_TEST_PROJECT_ID") catch null;
-    env.milestone_id = std.process.getEnvVarOwned(allocator, "LINEAR_TEST_MILESTONE_ID") catch null;
+    env.team_id = std.testing.environ.getAlloc(allocator, "LINEAR_TEST_TEAM_ID") catch null;
+    env.issue_id = std.testing.environ.getAlloc(allocator, "LINEAR_TEST_ISSUE_ID") catch null;
+    env.project_id = std.testing.environ.getAlloc(allocator, "LINEAR_TEST_PROJECT_ID") catch null;
+    env.milestone_id = std.testing.environ.getAlloc(allocator, "LINEAR_TEST_MILESTONE_ID") catch null;
     ensureTeamId(&env, allocator);
     return env;
 }
 
 fn makeConfig(allocator: Allocator, env: *const Env) !config.Config {
-    var cfg = config.Config{ .allocator = allocator };
+    var cfg = config.Config{ .allocator = allocator, .io = test_io, .environ = std.testing.environ };
     try cfg.setApiKey(env.api_key.?);
     if (env.team_id) |team| try cfg.setDefaultTeamId(team);
     return cfg;
@@ -77,7 +78,7 @@ const Capture = struct {
 };
 
 fn readAll(allocator: Allocator, fd: posix.fd_t) ![]u8 {
-    var buffer = std.ArrayListUnmanaged(u8){};
+    var buffer = std.ArrayListUnmanaged(u8).empty;
     errdefer buffer.deinit(allocator);
 
     var tmp: [256]u8 = undefined;
@@ -97,11 +98,11 @@ fn ensureTeamId(env: *Env, allocator: Allocator) void {
 
 fn fetchDefaultTeamId(allocator: Allocator, api_key: []const u8) !?[]u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(test_io, &stderr_buf);
     const stderr = &stderr_writer.interface;
 
-    var client = graphql.GraphqlClient.init(allocator, api_key);
-    defer graphql.deinitSharedClient();
+    var client = graphql.GraphqlClient.init(allocator, test_io, api_key);
+    defer graphql.deinitSharedClient(test_io);
     defer client.deinit();
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
@@ -113,8 +114,8 @@ fn fetchDefaultTeamId(allocator: Allocator, api_key: []const u8) !?[]u8 {
         \\}
     ;
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("first", .{ .integer = 1 });
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "first", .{ .integer = 1 });
 
     var response = common.send(allocator, "online setup", &client, .{
         .query = query,
@@ -125,7 +126,7 @@ fn fetchDefaultTeamId(allocator: Allocator, api_key: []const u8) !?[]u8 {
     };
     defer response.deinit();
 
-    common.checkResponse("online setup", &response, stderr, api_key) catch {
+    common.checkResponse(test_io, "online setup", &response, stderr, api_key) catch {
         return null;
     };
 
@@ -140,31 +141,55 @@ fn fetchDefaultTeamId(allocator: Allocator, api_key: []const u8) !?[]u8 {
     return duped;
 }
 
+/// `std.posix` no longer wraps `pipe`/`dup`/`dup2`/`close`, so the redirection
+/// harness calls libc directly and maps failures onto an explicit error.
+const RedirectError = error{RedirectFailed};
+
+fn openPipe() RedirectError![2]posix.fd_t {
+    var fds: [2]posix.fd_t = undefined;
+    if (std.c.pipe(&fds) != 0) return error.RedirectFailed;
+    return fds;
+}
+
+fn dupFd(fd: posix.fd_t) RedirectError!posix.fd_t {
+    const duped = std.c.dup(fd);
+    if (duped < 0) return error.RedirectFailed;
+    return duped;
+}
+
+fn dupFdTo(old_fd: posix.fd_t, new_fd: posix.fd_t) RedirectError!void {
+    if (std.c.dup2(old_fd, new_fd) < 0) return error.RedirectFailed;
+}
+
+fn closeFd(fd: posix.fd_t) void {
+    _ = std.c.close(fd);
+}
+
 fn captureOutput(allocator: Allocator, context: anytype, run_fn: anytype) !Capture {
-    var stdout_pipe = try posix.pipe();
-    defer if (stdout_pipe[0] != -1) posix.close(stdout_pipe[0]);
-    defer if (stdout_pipe[1] != -1) posix.close(stdout_pipe[1]);
+    var stdout_pipe = try openPipe();
+    defer if (stdout_pipe[0] != -1) closeFd(stdout_pipe[0]);
+    defer if (stdout_pipe[1] != -1) closeFd(stdout_pipe[1]);
 
-    var stderr_pipe = try posix.pipe();
-    defer if (stderr_pipe[0] != -1) posix.close(stderr_pipe[0]);
-    defer if (stderr_pipe[1] != -1) posix.close(stderr_pipe[1]);
+    var stderr_pipe = try openPipe();
+    defer if (stderr_pipe[0] != -1) closeFd(stderr_pipe[0]);
+    defer if (stderr_pipe[1] != -1) closeFd(stderr_pipe[1]);
 
-    const saved_stdout = try posix.dup(posix.STDOUT_FILENO);
-    const saved_stderr = try posix.dup(posix.STDERR_FILENO);
-    defer posix.close(saved_stdout);
-    defer posix.close(saved_stderr);
+    const saved_stdout = try dupFd(posix.STDOUT_FILENO);
+    const saved_stderr = try dupFd(posix.STDERR_FILENO);
+    defer closeFd(saved_stdout);
+    defer closeFd(saved_stderr);
 
-    try posix.dup2(stdout_pipe[1], posix.STDOUT_FILENO);
-    try posix.dup2(stderr_pipe[1], posix.STDERR_FILENO);
+    try dupFdTo(stdout_pipe[1], posix.STDOUT_FILENO);
+    try dupFdTo(stderr_pipe[1], posix.STDERR_FILENO);
 
     const exit_code = try run_fn(context);
 
-    posix.dup2(saved_stdout, posix.STDOUT_FILENO) catch {};
-    posix.dup2(saved_stderr, posix.STDERR_FILENO) catch {};
+    dupFdTo(saved_stdout, posix.STDOUT_FILENO) catch {};
+    dupFdTo(saved_stderr, posix.STDERR_FILENO) catch {};
 
-    posix.close(stdout_pipe[1]);
+    closeFd(stdout_pipe[1]);
     stdout_pipe[1] = -1;
-    posix.close(stderr_pipe[1]);
+    closeFd(stderr_pipe[1]);
     stderr_pipe[1] = -1;
 
     const stdout_data = try readAll(allocator, stdout_pipe[0]);
@@ -183,7 +208,7 @@ test "online auth test and me" {
 
     var cfg = try makeConfig(allocator, &env);
     defer cfg.deinit();
-    defer graphql.deinitSharedClient();
+    defer graphql.deinitSharedClient(test_io);
 
     const AuthRunner = struct {
         allocator: Allocator,
@@ -194,6 +219,7 @@ test "online auth test and me" {
             var args = [_][]const u8{"test"};
             return auth_cmd.run(.{
                 .allocator = r.allocator,
+                .io = test_io,
                 .config = r.cfg,
                 .args = args[0..],
                 .json_output = true,
@@ -226,6 +252,7 @@ test "online auth test and me" {
             var args = [_][]const u8{};
             return me_cmd.run(.{
                 .allocator = r.allocator,
+                .io = test_io,
                 .config = r.cfg,
                 .args = args[0..],
                 .retries = 0,
@@ -259,7 +286,7 @@ test "online teams list returns configured team when available" {
 
     var cfg = try makeConfig(allocator, &env);
     defer cfg.deinit();
-    defer graphql.deinitSharedClient();
+    defer graphql.deinitSharedClient(test_io);
 
     const Runner = struct {
         allocator: Allocator,
@@ -270,6 +297,7 @@ test "online teams list returns configured team when available" {
             var args = [_][]const u8{};
             return teams_cmd.run(.{
                 .allocator = r.allocator,
+                .io = test_io,
                 .config = r.cfg,
                 .args = args[0..],
                 .retries = 0,
@@ -315,7 +343,7 @@ test "online issues list succeeds without sub-issues" {
 
     var cfg = try makeConfig(allocator, &env);
     defer cfg.deinit();
-    defer graphql.deinitSharedClient();
+    defer graphql.deinitSharedClient(test_io);
 
     const Runner = struct {
         allocator: Allocator,
@@ -326,6 +354,7 @@ test "online issues list succeeds without sub-issues" {
             var args = [_][]const u8{ "--limit", "1", "--sub-limit", "0" };
             return issues_cmd.run(.{
                 .allocator = r.allocator,
+                .io = test_io,
                 .config = r.cfg,
                 .args = args[0..],
                 .retries = 0,
@@ -359,7 +388,7 @@ test "online issues list filters by state-type with alias" {
 
     var cfg = try makeConfig(allocator, &env);
     defer cfg.deinit();
-    defer graphql.deinitSharedClient();
+    defer graphql.deinitSharedClient(test_io);
 
     // Test that in_progress alias maps to started and doesn't error
     const Runner = struct {
@@ -371,6 +400,7 @@ test "online issues list filters by state-type with alias" {
             var args = [_][]const u8{ "--limit", "1", "--sub-limit", "0", "--state-type", "in_progress,started" };
             return issues_cmd.run(.{
                 .allocator = r.allocator,
+                .io = test_io,
                 .config = r.cfg,
                 .args = args[0..],
                 .retries = 0,
@@ -401,7 +431,7 @@ test "online issues list includes relation fields when enabled" {
 
     var cfg = try makeConfig(allocator, &env);
     defer cfg.deinit();
-    defer graphql.deinitSharedClient();
+    defer graphql.deinitSharedClient(test_io);
 
     const Runner = struct {
         allocator: Allocator,
@@ -420,6 +450,7 @@ test "online issues list includes relation fields when enabled" {
             };
             return issues_cmd.run(.{
                 .allocator = r.allocator,
+                .io = test_io,
                 .config = r.cfg,
                 .args = args[0..],
                 .retries = 0,
@@ -460,7 +491,7 @@ test "online issue view returns selected fields when identifier provided" {
 
     var cfg = try makeConfig(allocator, &env);
     defer cfg.deinit();
-    defer graphql.deinitSharedClient();
+    defer graphql.deinitSharedClient(test_io);
 
     const Runner = struct {
         allocator: Allocator,
@@ -479,6 +510,7 @@ test "online issue view returns selected fields when identifier provided" {
             };
             return issue_view_cmd.run(.{
                 .allocator = r.allocator,
+                .io = test_io,
                 .config = r.cfg,
                 .args = args[0..],
                 .retries = 0,
@@ -508,7 +540,7 @@ test "online introspection includes issue relations" {
 
     var cfg = try makeConfig(allocator, &env);
     defer cfg.deinit();
-    defer graphql.deinitSharedClient();
+    defer graphql.deinitSharedClient(test_io);
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -520,10 +552,10 @@ test "online introspection includes issue relations" {
         \\  }
         \\}
     ;
-    var query_file = try tmp.dir.createFile("schema.graphql", .{ .read = true, .truncate = true });
-    defer query_file.close();
-    try query_file.writeAll(query_contents);
-    const query_path = try tmp.dir.realpathAlloc(allocator, "schema.graphql");
+    const query_file = try tmp.dir.createFile(test_io, "schema.graphql", .{ .read = true, .truncate = true });
+    defer query_file.close(test_io);
+    try query_file.writeStreamingAll(test_io, query_contents);
+    const query_path = try tmp.dir.realPathFileAlloc(test_io, "schema.graphql", allocator);
     defer allocator.free(query_path);
 
     const Runner = struct {
@@ -543,6 +575,7 @@ test "online introspection includes issue relations" {
             };
             return gql_cmd.run(.{
                 .allocator = r.allocator,
+                .io = test_io,
                 .config = r.cfg,
                 .args = args[0..],
                 .json_output = true,
@@ -593,9 +626,9 @@ test "online issue create and delete (opt-in)" {
 
     var cfg = try makeConfig(allocator, &env);
     defer cfg.deinit();
-    defer graphql.deinitSharedClient();
+    defer graphql.deinitSharedClient(test_io);
 
-    const timestamp = std.time.timestamp();
+    const timestamp = std.Io.Clock.real.now(test_io).toSeconds();
     var title_buffer: [64]u8 = undefined;
     const title = try std.fmt.bufPrint(&title_buffer, "CLI online test {d}", .{timestamp});
 
@@ -610,6 +643,7 @@ test "online issue create and delete (opt-in)" {
             var args = [_][]const u8{ "--team", r.team, "--title", r.title, "--yes", "--data-only" };
             return issue_create_cmd.run(.{
                 .allocator = r.allocator,
+                .io = test_io,
                 .config = r.cfg,
                 .args = args[0..],
                 .retries = 0,
@@ -641,6 +675,7 @@ test "online issue create and delete (opt-in)" {
             var args = [_][]const u8{ r.id, "--yes" };
             return issue_delete_cmd.run(.{
                 .allocator = r.allocator,
+                .io = test_io,
                 .config = r.cfg,
                 .args = args[0..],
                 .retries = 0,

@@ -45,6 +45,10 @@ pub const MockServer = struct {
     allocator: Allocator,
     fixtures: std.StringHashMap(ResponseSeries),
     last_request: ?CapturedRequest = null,
+    /// Number of `send` calls this server has served. Tests that care about how
+    /// many requests a command made — bulk dedupe, pagination page counts —
+    /// assert on this rather than inferring it from the output.
+    request_count: usize = 0,
 
     pub const CapturedRequest = struct {
         operation: []const u8,
@@ -78,7 +82,7 @@ pub const MockServer = struct {
     }
 
     pub fn setResponses(self: *MockServer, operation: []const u8, responses: []const MockResponse) !void {
-        var list = std.ArrayListUnmanaged(MockResponse){};
+        var list = std.ArrayListUnmanaged(MockResponse).empty;
         errdefer {
             for (list.items) |item| {
                 self.allocator.free(item.body);
@@ -136,7 +140,7 @@ pub const MockServer = struct {
 
         var vars_copy: ?[]u8 = null;
         if (variables) |vars_value| {
-            var out: std.io.Writer.Allocating = .init(self.allocator);
+            var out: std.Io.Writer.Allocating = .init(self.allocator);
             defer out.deinit();
 
             var jw = std.json.Stringify{ .writer = &out.writer, .options = .{ .whitespace = .minified } };
@@ -174,6 +178,7 @@ pub fn useServer(server: *MockServer) ServerScope {
 
 pub const GraphqlClient = struct {
     allocator: Allocator,
+    io: std.Io,
     api_key: []const u8,
     endpoint: []const u8 = "https://api.linear.app/graphql",
     keep_alive: bool = true,
@@ -242,9 +247,10 @@ pub const GraphqlClient = struct {
         }
     };
 
-    pub fn init(allocator: Allocator, api_key: []const u8) GraphqlClient {
+    pub fn init(allocator: Allocator, io: std.Io, api_key: []const u8) GraphqlClient {
         return .{
             .allocator = allocator,
+            .io = io,
             .api_key = api_key,
             .server = active_server,
         };
@@ -256,6 +262,7 @@ pub const GraphqlClient = struct {
 
     pub fn send(self: *GraphqlClient, allocator: Allocator, req: Request) !Response {
         const server = self.server orelse return Error.MockServerNotInstalled;
+        server.request_count += 1;
         const op_name = req.operation_name orelse return Error.MissingOperationName;
         const fixture = server.lookup(op_name) orelse return Error.MissingFixture;
         try server.recordRequest(op_name, req.query, req.variables);
@@ -269,8 +276,6 @@ pub const GraphqlClient = struct {
     }
 };
 
-pub fn loadFixture(allocator: Allocator, path: []const u8) ![]u8 {
-    var file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    return file.readToEndAlloc(allocator, 64 * 1024);
+pub fn loadFixture(allocator: Allocator, io: std.Io, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024));
 }

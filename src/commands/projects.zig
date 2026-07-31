@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
@@ -28,7 +29,7 @@ const Options = struct {
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseOptions(ctx.args) catch |err| {
         const message = switch (err) {
@@ -42,7 +43,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try usage(&out_writer.interface);
         return 0;
     }
@@ -58,7 +59,7 @@ pub fn run(ctx: Context) !u8 {
         }
     }
 
-    var field_buf = std.ArrayListUnmanaged(printer.ProjectField){};
+    var field_buf = std.ArrayListUnmanaged(printer.ProjectField).empty;
     defer field_buf.deinit(ctx.allocator);
     const selected_fields = parseProjectFields(opts.fields, &field_buf, ctx.allocator) catch |err| {
         const message = switch (err) {
@@ -79,7 +80,7 @@ pub fn run(ctx: Context) !u8 {
         .truncate = !disable_trunc,
     };
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -103,43 +104,43 @@ pub fn run(ctx: Context) !u8 {
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
     const limit_i64 = std.math.cast(i64, opts.limit) orelse return error.InvalidLimit;
-    try variables.object.put("first", .{ .integer = limit_i64 });
+    try variables.object.put(var_alloc, "first", .{ .integer = limit_i64 });
 
     var has_filter = false;
-    var filter = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+    var filter = std.json.Value{ .object = std.json.ObjectMap.empty };
     if (opts.team) |team_raw| {
         const trimmed = std.mem.trim(u8, team_raw, " \t");
         if (trimmed.len == 0) {
             try stderr.print("projects list: invalid --team value\n", .{});
             return 1;
         }
-        var eq_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-        try eq_obj.object.put("eq", .{ .string = trimmed });
+        var eq_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try eq_obj.object.put(var_alloc, "eq", .{ .string = trimmed });
 
-        var team_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+        var team_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
         if (isUuid(trimmed)) {
-            try team_obj.object.put("id", eq_obj);
+            try team_obj.object.put(var_alloc, "id", eq_obj);
         } else {
-            try team_obj.object.put("key", eq_obj);
+            try team_obj.object.put(var_alloc, "key", eq_obj);
         }
-        var teams_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-        try teams_obj.object.put("some", team_obj);
-        try filter.object.put("accessibleTeams", teams_obj);
+        var teams_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try teams_obj.object.put(var_alloc, "some", team_obj);
+        try filter.object.put(var_alloc, "accessibleTeams", teams_obj);
         has_filter = true;
     }
     if (status_id) |sid| {
-        var id_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-        try id_obj.object.put("eq", .{ .string = sid });
+        var id_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try id_obj.object.put(var_alloc, "eq", .{ .string = sid });
 
-        var status_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-        try status_obj.object.put("id", id_obj);
-        try filter.object.put("status", status_obj);
+        var status_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try status_obj.object.put(var_alloc, "id", id_obj);
+        try filter.object.put(var_alloc, "status", status_obj);
         has_filter = true;
     }
     if (has_filter) {
-        try variables.object.put("filter", filter);
+        try variables.object.put(var_alloc, "filter", filter);
     }
 
     const query =
@@ -160,7 +161,7 @@ pub fn run(ctx: Context) !u8 {
     };
     defer response.deinit();
 
-    common.checkResponse("projects list", &response, stderr, api_key) catch {
+    common.checkResponse(ctx.io, "projects list", &response, stderr, api_key) catch {
         return 1;
     };
 
@@ -171,7 +172,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (ctx.json_output) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printJson(data_value, &out_writer.interface, true);
         return 0;
     }
@@ -188,7 +189,7 @@ pub fn run(ctx: Context) !u8 {
     const has_next = if (page_info) |pi| common.getBoolField(pi, "hasNextPage") orelse false else false;
     const end_cursor = if (page_info) |pi| common.getStringField(pi, "endCursor") else null;
 
-    var rows = std.ArrayListUnmanaged(printer.ProjectRow){};
+    var rows = std.ArrayListUnmanaged(printer.ProjectRow).empty;
     defer rows.deinit(ctx.allocator);
 
     for (nodes_array.items) |node| {
@@ -214,7 +215,7 @@ pub fn run(ctx: Context) !u8 {
     }
 
     var out_buf: [0]u8 = undefined;
-    var out_writer = std.fs.File.stdout().writer(&out_buf);
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     try printer.printProjectTable(ctx.allocator, &out_writer.interface, rows.items, selected_fields, table_opts);
 
     if (has_next) {

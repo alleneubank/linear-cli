@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
@@ -32,11 +33,15 @@ const UnsetOptions = struct {
     help: bool = false,
 };
 
-const ConfigKey = enum { default_team_id, default_output, default_state_filter };
+/// `credential_helper` is unset-only here: it is written by
+/// `linear auth migrate --to helper`, which verifies the helper actually
+/// returns the right key before committing it. `config set` has no way to run
+/// that check, and a helper that is stored but broken locks you out.
+const ConfigKey = enum { default_team_id, default_output, default_state_filter, credential_helper };
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
 
     if (ctx.args.len == 0) {
@@ -58,7 +63,7 @@ pub fn run(ctx: Context) !u8 {
 
 fn runShow(ctx: Context, args: [][]const u8) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseShowOptions(args) catch |err| {
         try stderr.print("config show: {s}\n", .{@errorName(err)});
@@ -68,7 +73,7 @@ fn runShow(ctx: Context, args: [][]const u8) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try showUsage(&out_writer.interface);
         return 0;
     }
@@ -76,15 +81,18 @@ fn runShow(ctx: Context, args: [][]const u8) !u8 {
     const filter_display = try formatStateFilter(ctx.allocator, ctx.config.default_state_filter);
     defer ctx.allocator.free(filter_display);
 
+    const helper_display = try formatCredentialHelper(ctx.allocator, ctx.config.credential_helper);
+    defer ctx.allocator.free(helper_display);
+
     const state_filter_value: []const u8 = if (filter_display.len == 0) "(none)" else filter_display;
     const team_value: []const u8 = if (ctx.config.default_team_id.len == 0) "(not set)" else ctx.config.default_team_id;
     const config_path = ctx.config.config_path orelse "(unknown)";
 
     if (ctx.json_output) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
 
-        var json_buffer = std.io.Writer.Allocating.init(ctx.allocator);
+        var json_buffer = std.Io.Writer.Allocating.init(ctx.allocator);
         defer json_buffer.deinit();
         var jw = std.json.Stringify{ .writer = &json_buffer.writer, .options = .{ .whitespace = .indent_2 } };
         try jw.beginObject();
@@ -100,6 +108,14 @@ fn runShow(ctx: Context, args: [][]const u8) !u8 {
             try jw.write(entry);
         }
         try jw.endArray();
+        try jw.objectField("credential_helper");
+        if (ctx.config.credential_helper) |argv| {
+            try jw.beginArray();
+            for (argv) |entry| try jw.write(entry);
+            try jw.endArray();
+        } else {
+            try jw.write(null);
+        }
         try jw.endObject();
 
         try out_writer.interface.writeAll(json_buffer.writer.buffered());
@@ -111,17 +127,18 @@ fn runShow(ctx: Context, args: [][]const u8) !u8 {
         .{ .key = "default_team_id", .value = team_value },
         .{ .key = "default_output", .value = ctx.config.default_output },
         .{ .key = "default_state_filter", .value = state_filter_value },
+        .{ .key = "credential_helper", .value = helper_display },
     };
 
     var out_buf: [0]u8 = undefined;
-    var out_writer = std.fs.File.stdout().writer(&out_buf);
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     try printer.printKeyValues(&out_writer.interface, pairs[0..]);
     return 0;
 }
 
 fn runSet(ctx: Context, args: [][]const u8) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseSetOptions(args) catch |err| {
         try stderr.print("config set: {s}\n", .{@errorName(err)});
@@ -131,7 +148,7 @@ fn runSet(ctx: Context, args: [][]const u8) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try setUsage(&out_writer.interface);
         return 0;
     }
@@ -159,10 +176,20 @@ fn runSet(ctx: Context, args: [][]const u8) !u8 {
         return 1;
     }
 
+    if (parsed_key == .credential_helper) {
+        try stderr.print(
+            "config set: credential_helper is set by 'linear auth migrate --to helper <command>', " ++
+                "which verifies the helper before storing it\n",
+            .{},
+        );
+        return 1;
+    }
+
     const save_result = switch (parsed_key) {
         .default_output => setDefaultOutput(ctx, trimmed_value, stderr),
         .default_state_filter => setDefaultStateFilter(ctx, trimmed_value, stderr),
         .default_team_id => setDefaultTeam(ctx, trimmed_value, stderr),
+        .credential_helper => unreachable,
     };
     save_result catch |err| switch (err) {
         error.InvalidValue => return 1,
@@ -179,14 +206,14 @@ fn runSet(ctx: Context, args: [][]const u8) !u8 {
     }
 
     var out_buf: [0]u8 = undefined;
-    var out_writer = std.fs.File.stdout().writer(&out_buf);
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     try out_writer.interface.print("{s} saved\n", .{keyLabel(parsed_key)});
     return 0;
 }
 
 fn runUnset(ctx: Context, args: [][]const u8) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseUnsetOptions(args) catch |err| {
         try stderr.print("config unset: {s}\n", .{@errorName(err)});
@@ -196,7 +223,7 @@ fn runUnset(ctx: Context, args: [][]const u8) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try unsetUsage(&out_writer.interface);
         return 0;
     }
@@ -216,6 +243,7 @@ fn runUnset(ctx: Context, args: [][]const u8) !u8 {
         .default_team_id => ctx.config.resetDefaultTeamId(),
         .default_output => ctx.config.resetDefaultOutput(),
         .default_state_filter => ctx.config.resetStateFilter(),
+        .credential_helper => ctx.config.clearCredentialHelper(),
     }
 
     if (ctx.config.save(ctx.allocator, ctx.config_path)) |_| {} else |err| {
@@ -224,7 +252,7 @@ fn runUnset(ctx: Context, args: [][]const u8) !u8 {
     }
 
     var out_buf: [0]u8 = undefined;
-    var out_writer = std.fs.File.stdout().writer(&out_buf);
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     try out_writer.interface.print("{s} reset\n", .{keyLabel(parsed_key)});
     return 0;
 }
@@ -258,7 +286,7 @@ fn setDefaultTeam(ctx: Context, value: []const u8, stderr: anytype) !void {
         return common.CommandError.CommandFailed;
     };
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -279,15 +307,15 @@ fn validateTeamSelection(ctx: Context, client: *graphql.GraphqlClient, team_valu
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var filter = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    var eq_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try eq_obj.object.put("eq", .{ .string = team_value });
+    var filter = std.json.Value{ .object = std.json.ObjectMap.empty };
+    var eq_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try eq_obj.object.put(var_alloc, "eq", .{ .string = team_value });
     const filter_key = if (isUuid(team_value)) "id" else "key";
-    try filter.object.put(filter_key, eq_obj);
+    try filter.object.put(var_alloc, filter_key, eq_obj);
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("filter", filter);
-    try variables.object.put("first", .{ .integer = 1 });
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "filter", filter);
+    try variables.object.put(var_alloc, "first", .{ .integer = 1 });
 
     const query =
         \\query TeamLookup($filter: TeamFilter, $first: Int!) {
@@ -306,7 +334,7 @@ fn validateTeamSelection(ctx: Context, client: *graphql.GraphqlClient, team_valu
     };
     defer response.deinit();
 
-    common.checkResponse("config set", &response, stderr, client.api_key) catch {
+    common.checkResponse(ctx.io, "config set", &response, stderr, client.api_key) catch {
         return common.CommandError.CommandFailed;
     };
 
@@ -407,6 +435,7 @@ fn parseKey(value: []const u8) ?ConfigKey {
     if (std.ascii.eqlIgnoreCase(value, "default_team_id")) return .default_team_id;
     if (std.ascii.eqlIgnoreCase(value, "default_output")) return .default_output;
     if (std.ascii.eqlIgnoreCase(value, "default_state_filter")) return .default_state_filter;
+    if (std.ascii.eqlIgnoreCase(value, "credential_helper")) return .credential_helper;
     return null;
 }
 
@@ -415,11 +444,26 @@ fn keyLabel(key: ConfigKey) []const u8 {
         .default_team_id => "default_team_id",
         .default_output => "default_output",
         .default_state_filter => "default_state_filter",
+        .credential_helper => "credential_helper",
     };
 }
 
+/// Renders the helper argv for display. Helper argv is operator-supplied
+/// configuration, not a secret; the key it fetches never passes through here.
+fn formatCredentialHelper(allocator: Allocator, argv: ?[]const []const u8) ![]u8 {
+    const entries = argv orelse return allocator.dupe(u8, "(not set)");
+
+    var buffer = std.ArrayListUnmanaged(u8).empty;
+    errdefer buffer.deinit(allocator);
+    for (entries, 0..) |entry, idx| {
+        if (idx > 0) try buffer.append(allocator, ' ');
+        try buffer.appendSlice(allocator, entry);
+    }
+    return buffer.toOwnedSlice(allocator);
+}
+
 fn parseStateFilterValues(allocator: Allocator, raw: []const u8) ![]const []const u8 {
-    var values = std.ArrayListUnmanaged([]const u8){};
+    var values = std.ArrayListUnmanaged([]const u8).empty;
     errdefer values.deinit(allocator);
 
     var iter = std.mem.tokenizeScalar(u8, raw, ',');
@@ -437,7 +481,7 @@ fn formatStateFilter(allocator: Allocator, values: []const []const u8) ![]u8 {
         return allocator.dupe(u8, "(none)");
     }
 
-    var buffer = std.ArrayListUnmanaged(u8){};
+    var buffer = std.ArrayListUnmanaged(u8).empty;
     errdefer buffer.deinit(allocator);
     for (values, 0..) |entry, idx| {
         if (idx > 0) try buffer.append(allocator, ',');
@@ -482,6 +526,9 @@ pub fn setUsage(writer: anytype) !void {
         \\  default_team_id       Default team for commands (team key or UUID)
         \\  default_output        Default output format: table|json
         \\  default_state_filter  Comma-separated state types to exclude by default
+        \\Read-only here:
+        \\  credential_helper     Set by 'linear auth migrate --to helper <command>';
+        \\                        remove with 'linear config unset credential_helper'
         \\Flags:
         \\  --help                Show this help message
         \\Examples:
@@ -499,12 +546,14 @@ pub fn unsetUsage(writer: anytype) !void {
         \\  default_team_id       Default team for commands
         \\  default_output        Default output format
         \\  default_state_filter  Default state exclusion filter
+        \\  credential_helper     External command that prints the API key
         \\Flags:
         \\  --help                Show this help message
         \\Examples:
         \\  linear config unset default_team_id
         \\  linear config unset default_output
         \\  linear config unset default_state_filter
+        \\  linear config unset credential_helper
         \\
     , .{});
 }

@@ -1,0 +1,14 @@
+{
+  "data": {
+    "commentUpdate": {
+      "success": true,
+      "comment": {
+        "id": "comment-1",
+        "body": "Corrected text",
+        "url": "https://linear.app/acme/issue/ENG-123#comment-1",
+        "updatedAt": "2024-02-01T12:00:00.000Z",
+        "issue": { "identifier": "ENG-123" }
+      }
+    }
+  }
+}

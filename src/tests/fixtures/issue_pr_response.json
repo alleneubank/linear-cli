@@ -1,0 +1,9 @@
+{
+  "data": {
+    "issue": {
+      "identifier": "ENG-777",
+      "title": "Fix \"quoting\"; rm -rf / && echo $(whoami)",
+      "url": "https://linear.app/acme/issue/ENG-777/fix-quoting"
+    }
+  }
+}

@@ -1,0 +1,4 @@
+ID       Name          Color    Team
+label-1  bug           #eb5757  ENG 
+label-2  feature       #26b5ce  ENG 
+label-3  needs-triage  #f2c94c      

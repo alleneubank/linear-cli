@@ -1,0 +1,16 @@
+{
+  "data": {
+    "workflowStates": {
+      "nodes": [
+        { "id": "state-1", "name": "Backlog", "type": "backlog", "position": 0, "team": { "key": "ENG" } },
+        { "id": "state-2", "name": "Todo", "type": "unstarted", "position": 1, "team": { "key": "ENG" } },
+        { "id": "state-3", "name": "In Progress", "type": "started", "position": 2.5, "team": { "key": "ENG" } },
+        { "id": "state-4", "name": "Done", "type": "completed", "position": 3, "team": { "key": "ENG" } }
+      ],
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "cursor-state-4"
+      }
+    }
+  }
+}

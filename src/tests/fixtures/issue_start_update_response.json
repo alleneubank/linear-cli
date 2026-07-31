@@ -1,0 +1,12 @@
+{
+  "data": {
+    "issueUpdate": {
+      "success": true,
+      "issue": {
+        "id": "issue-start-1",
+        "identifier": "ENG-321",
+        "state": { "name": "In Progress" }
+      }
+    }
+  }
+}

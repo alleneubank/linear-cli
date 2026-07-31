@@ -1,0 +1,9 @@
+{
+  "data": {
+    "projectMilestone": {
+      "id": "ms-2",
+      "name": "Beta",
+      "project": { "id": "project-1", "name": "Roadmap" }
+    }
+  }
+}
