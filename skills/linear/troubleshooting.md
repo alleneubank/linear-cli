@@ -4,12 +4,37 @@ Common errors and their solutions when using the Linear CLI.
 
 ## Table of Contents
 
-1. [Authentication Errors](#authentication-errors)
-2. [Empty Results](#empty-results)
-3. [Mutation Errors](#mutation-errors)
-4. [GraphQL Errors](#graphql-errors)
-5. [Connection Errors](#connection-errors)
-6. [Debugging Steps](#debugging-steps)
+1. [Read stderr first](#read-stderr-first)
+2. [Authentication Errors](#authentication-errors)
+3. [Empty Results](#empty-results)
+4. [Branch Inference Errors](#branch-inference-errors)
+5. [Content Flag Errors](#content-flag-errors)
+6. [Mutation Errors](#mutation-errors)
+7. [Bulk Delete Errors](#bulk-delete-errors)
+8. [GraphQL Errors](#graphql-errors)
+9. [Connection Errors](#connection-errors)
+10. [Debugging Steps](#debugging-steps)
+
+---
+
+## Read stderr first
+
+Every diagnostic this CLI emits goes to **stderr**, including the ones that are not errors:
+
+- confirmation refusals (`... confirmation required; re-run with --yes to proceed`)
+- pagination notices (`issues list: fetched 25 items across 1 page; more available, resume with --cursor ...`)
+- truncation notices (`issue view: comments limited to 10; additional comments omitted`)
+- rate-limit details (`...: rate limit: remaining 0/1500; reset in ~42000ms`)
+- config permission warnings
+- credential-backend diagnostics (`linear: credential_helper '...' exited 1: ...`) and the plaintext-key
+  warning (`warning: API key read from ...`), both emitted before the subcommand even starts
+
+A command run as `linear ... | jq` shows none of them, which is why failed mutations read as silent
+no-ops. Check the exit code, and keep stderr visible or capture it explicitly:
+
+```bash
+linear issue update ENG-123 --assignee me --yes 2>/tmp/linear.err || cat /tmp/linear.err
+```
 
 ---
 
@@ -17,7 +42,12 @@ Common errors and their solutions when using the Linear CLI.
 
 ### 401 Unauthorized
 
-**Symptom:** Command fails with `401` or "Unauthorized" message.
+**Symptom:** stderr shows
+
+```
+<cmd>: HTTP status 401
+<cmd>: unauthorized (key lin_...abcd); verify LINEAR_API_KEY or run 'linear auth set'
+```
 
 **Causes:**
 - API key not configured
@@ -27,33 +57,233 @@ Common errors and their solutions when using the Linear CLI.
 **Solutions:**
 
 ```bash
-# Test current auth
+# Which backend supplied the key? Start here — it never prints the key.
+linear auth status
+
+# Does that key work? (one `viewer` request)
 linear auth test
 
-# Reconfigure API key
-linear auth set
-
-# Check what key is configured (masked)
-linear auth show --redacted
+# Move a plaintext config-file key to a real backend
+linear auth migrate --to keychain
+linear auth migrate --to helper op read "op://<vault>/<item>/<field>"
 ```
+
+`auth status` is the first command to run for any auth question, because a 401 does not say *which* of the
+four backends produced the offending key. It prints the source, whether a key is present and valid, the
+configured `credential_helper` argv, whether the keychain backend exists on this platform, whether a
+plaintext key is still in the config file, and the config path — and exits 1 when no usable key was found:
+
+```
+source           : credential_helper
+key              : present (valid)
+credential_helper: op read op://Private/Linear/api-key
+keychain         : /usr/bin/security
+file_api_key     : absent
+config_path      : /Users/you/.config/linear/config.json
+```
+
+**Never print the key.** `linear auth status` answers "where is my credential coming from" without the key
+reaching any stream — not stdout, not stderr, not the `--json` object, not even a redacted fingerprint —
+so it is the thing to run instead of `auth show`. `auth show` is redacted (`lin_...abcd`; under 16
+characters it prints `<redacted>`) including with `--json`, and `--reveal` is refused unless stdout is a
+terminal (`auth show: refusing to reveal the API key because stdout is not a terminal`), so in an automated
+session it fails instead of leaking. Do not run `linear auth show --reveal`, do not echo `$LINEAR_API_KEY`,
+and do not route either through a file or pipe to get around the TTY check. `--redacted` still parses, but
+it is a no-op alias.
 
 **Note:** API keys are created at [Linear Settings → API](https://linear.app/settings/api).
 
 ### Missing API Key
 
-**Symptom:** "No API key configured" or similar message.
+**Symptom:** stderr shows `<cmd>: missing API key; set LINEAR_API_KEY or run 'linear auth set'`.
+
+**Cause:** no backend in the chain produced a key — *or* a configured one failed. Resolution order,
+highest precedence first:
+
+```
+LINEAR_API_KEY  ->  credential_helper  ->  keychain (macOS)  ->  config file (deprecated, warns)
+```
+
+Run `linear auth status` before doing anything else. `source: none` means nothing is configured;
+`source: credential_helper (failed)` means a helper is configured and broke — see
+[Credential Helper Failures](#credential-helper-failures), because that state is **not** fixed by
+supplying the key somewhere else lower in the chain.
 
 **Solution:**
 ```bash
-# Option 1: Interactive setup
-linear auth set
+# Option 1 (preferred): point a credential_helper at your secret manager.
+# migrate only *moves* a key that is already in the config file — it uploads
+# nothing — so store the key in the manager first, then land it on disk once.
+op read "op://<vault>/<item>/<field>" | linear auth set
+linear auth migrate --to helper op read "op://<vault>/<item>/<field>"
 
-# Option 2: Environment variable
+# Option 2 (macOS, no secret manager): the login keychain. Same bootstrap.
+linear auth migrate --to keychain
+
+# Option 3: environment variable (read on every run, never written to the config file)
 export LINEAR_API_KEY="lin_api_..."
 linear auth test
 
-# Option 3: Direct flag
-linear auth set --api-key "lin_api_..."
+# Option 4 (deprecated as a destination): leave it in the config file, plaintext
+linear auth set
+```
+
+Prefer option 1. Option 4 stores the key in cleartext and makes the CLI warn on every run that reads it
+(`warning: API key read from ...; the config file stores it in plaintext.`); it survives mainly as the
+step `auth migrate` migrates *from* — there is no other way to install a `credential_helper` from the CLI,
+since `config set credential_helper` is refused. A literal key typed after `export` lands in shell history
+and in the environment of every child process.
+
+Nothing but the config file is ever written to disk: a key from the environment, a helper, or the keychain
+is never persisted, and a key already in the config file survives saves made while one of them is
+supplying the effective value.
+
+**Note:** there is no `--api-key` flag — keys are never accepted on argv, where
+they would leak into `ps` output and shell history.
+
+### Credential Helper Failures
+
+**Symptom:** every API command reports `missing API key`, and stderr carries one of these first (`CMD` is
+the configured argv, joined for display — it is configuration, not a secret):
+
+```
+linear: credential_helper 'CMD' was not found on PATH
+linear: credential_helper 'CMD' could not be started
+linear: credential_helper 'CMD' did not finish in time
+linear: credential_helper 'CMD' exited 1: <first line of the helper's stderr>
+linear: credential_helper 'CMD' produced no output
+linear: credential_helper 'CMD' produced more than 512 characters, which cannot be an API key
+linear: credential_helper 'CMD' produced something that is not a valid API key; expected 4-512 characters from [A-Za-z0-9_-]
+```
+
+**Cause:** a configured helper that fails **clears the effective key instead of falling through**. Falling
+back would silently reinstate the plaintext config-file key the helper was configured to replace, so the
+chain stops at the failure. The keychain is not tried either. The key on disk is left untouched, so
+`auth migrate` can still find it later.
+
+The helper's **stdout is never printed, logged, or quoted** — that is where the secret is. Only the exit
+status and the first line of stderr (200 bytes, control bytes stripped) reach the diagnostic.
+
+**The escape hatch:** neither of these needs a key, so both still work in this state — the diagnostic and
+the fix are always reachable.
+
+```bash
+linear auth status                        # source: credential_helper (failed); exits 1
+linear config unset credential_helper     # drop the helper; the next backend takes over
+```
+
+**Solution:** run the helper by hand and confirm it prints the bare key on stdout and nothing else.
+
+```bash
+op read "op://<vault>/<item>/<field>" | wc -c    # length only — do not print the key
+```
+
+Common causes, in order of likelihood:
+
+- Vault locked or session expired → the helper exits non-zero; its own stderr is quoted in the diagnostic.
+- Wrong item path → same shape, `exited 1: ...`.
+- The helper prints JSON, a banner, or a `Warning:` line alongside the key → `produced something that is
+  not a valid API key`, or `produced more than 512 characters`.
+- The helper waits on a biometric/2FA prompt nobody answers → `did not finish in time` after the 60 s
+  budget. It is killed, not retried.
+- The value was written as a shell pipeline → the shell metacharacters were passed to the binary as
+  ordinary argv elements. `credential_helper` is argv, not a command line: no quoting, no pipes, no
+  `$VAR`, no globs. Wrap the pipeline in a script and point the helper at the script.
+
+**Config-file syntax errors** show up earlier, at load time, with the error name rather than a sentence:
+
+```
+failed to load config: EmptyCredentialHelper
+failed to load config: TooManyCredentialHelperArgs
+failed to load config: InvalidCredentialHelperArg
+failed to load config: InvalidCredentialHelper
+```
+
+The bounds are 16 argv elements, 1024 bytes per element, no empty elements, and the value must be a JSON
+array of strings — or a bare string, which is split on ASCII whitespace with the same no-shell rule.
+
+### Moving a Plaintext Key Off Disk
+
+**Symptom:** every run prints
+
+```
+warning: API key read from /Users/you/.config/linear/config.json; the config file stores it in plaintext. Move it with 'linear auth migrate --to helper <command>' or 'linear auth migrate --to keychain'.
+```
+
+**Cause:** the deprecated file backend is what supplied the key. It warns every single time.
+
+**Solution:**
+
+```bash
+linear auth migrate --to keychain
+linear auth migrate --to helper op read "op://<vault>/<item>/<field>"
+linear auth migrate --to helper "pass show linear/api-key"   # single argument, split on whitespace
+```
+
+`migrate` writes to the chosen backend, reads it back, and compares before the plaintext copy is removed,
+so a failed migration never leaves you without a credential. `--to` is required — it will not pick a
+backend for you. `--to helper` pushes nothing anywhere: put the key in the secret manager first, and the
+migration verifies the helper hands back the same one.
+
+**Rotate the key afterwards.** `migrate` says so itself:
+
+```
+api key migrated to keychain; the plaintext copy has been removed from the config file
+the key was on disk in plaintext, so treat it as disclosed and consider rotating it
+```
+
+Removal overwrites the old bytes in place before rewriting the file rather than truncating over them, but
+that is **best effort by nature**: on a copy-on-write filesystem (APFS) the overwrite may land on fresh
+blocks, and it says nothing about snapshots, Time Machine copies, or synced folders that already captured
+the file.
+
+**What the keychain does and does not buy you.** `--to keychain` stores the key as a generic password
+(service `linear-cli`, account `api-key`) read through `/usr/bin/security`, and the secret never appears
+in an argv on either the read or the write path. The win is **encryption at rest** and immunity to
+accidental disclosure — backups, synced folders, a stray `cat` of the config, a screen share. It is
+**not** process isolation: the item is created through `security`, so it is ACL'd to `/usr/bin/security`,
+and any process running as you can read it back non-interactively with no prompt. The backend does not
+exist on Linux or Windows (`auth migrate: the keychain backend is only available on macOS`); use a helper
+there.
+
+**Migration refusals** — all of these leave the plaintext key exactly where it was:
+
+```
+auth migrate: missing --to; expected '--to helper <command>' or '--to keychain'
+auth migrate: no API key in the config file to migrate
+auth migrate: '--to helper' needs the command that prints the API key
+auth migrate: credential_helper 'CMD' returned a different key than the config file holds; nothing was changed
+auth migrate: the keychain read back a different key than was written; nothing was changed
+auth migrate: the keychain item could not be read back after writing it; nothing was changed
+auth migrate: this API key starts with '-', which /usr/bin/security would read as an option; use '--to helper' instead
+```
+
+`no API key in the config file to migrate` is the common one: only an on-disk key is migratable. A key
+from `LINEAR_API_KEY`, a helper, or the keychain is either not `migrate`'s to move or already where it
+belongs.
+
+### Invalid API Key Format
+
+**Symptom:** stderr shows one of
+
+```
+auth set: invalid API key; expected 4-512 characters from [A-Za-z0-9_-]
+failed to load config: api key must be 4-512 characters from [A-Za-z0-9_-]
+```
+
+**Cause:** the key is validated on every ingestion path — `auth set`, the config file, `LINEAR_CONFIG`,
+`LINEAR_API_KEY`, and every credential backend (a helper's stdout and the keychain item are checked before
+either can become the effective key). Anything outside `[A-Za-z0-9_-]` is rejected, notably a trailing `\r`
+from a Windows-authored file or a wrapped/quoted paste, because those bytes reach the `Authorization`
+header.
+
+**Solution:** re-supply the bare key with no quotes or trailing newline junk. `auth set` writes nothing to
+disk when validation fails, so the previous config is intact. When a helper is the source, the message is
+`linear: credential_helper 'CMD' produced something that is not a valid API key; ...` instead — see
+[Credential Helper Failures](#credential-helper-failures).
+
+```bash
+op read "op://<vault>/<item>/<field>" | linear auth set
 ```
 
 ---
@@ -62,43 +292,153 @@ linear auth set --api-key "lin_api_..."
 
 ### No Issues Returned
 
-**Symptom:** `linear issues list` returns 0 items.
+**Symptom:** `linear issues list` returns 0 items, or stderr shows
+`issues list: missing team selection` / `issues list: team 'X' not found`.
 
 **Causes:**
-1. No team specified and no default team set
+1. No team specified and no default team set (`issues list: missing team selection`)
 2. All issues are completed/canceled (filtered by default)
-3. Wrong team key/ID
+3. Wrong team key/ID (`issues list: team 'X' not found`)
+4. A `--state` value that is a state *name* rather than a state *type* — `--state` on `issues list` is an
+   alias of `--state-type` and only accepts `triage,backlog,unstarted,started,completed,canceled`
+5. An `--updated-since`/`--created-since` boundary that excludes everything. Both compare **strictly
+   greater than**, so an issue stamped exactly at the boundary is filtered out, and the value is
+   forwarded to Linear verbatim — a non-ISO-8601 string is rejected by the API, not by the CLI
 
 **Solutions:**
 
 ```bash
 # List available teams first
-linear teams list
+linear teams list --fields id,key
 
 # Specify team explicitly
-linear issues list --team TEAM_KEY
+linear issues list --team TEAM_KEY --limit 20 --sub-limit 0
 
 # Include all issues (including completed/canceled)
-linear issues list --team TEAM_KEY --state-type backlog,unstarted,started,completed,canceled
+linear issues list --team TEAM_KEY --limit 20 --sub-limit 0 \
+  --state-type backlog,unstarted,started,completed,canceled
+
+# Filter on one specific workflow state (needs a state UUID, not a name)
+linear states list --team TEAM_KEY --limit 50 --fields id,name,type --data-only
+linear issues list --team TEAM_KEY --state-id <STATE_UUID> --limit 20 --sub-limit 0
+
+# Widen a time filter (both are exclusive) and sort explicitly
+linear issues list --team TEAM_KEY --updated-since 2026-01-01T00:00:00Z \
+  --sort updated:desc --limit 20 --sub-limit 0
+```
+
+The same applies to the other id-only filters — `linear labels list --team KEY`,
+`linear users list`, and `linear milestone list --project ID|NAME` enumerate the candidates for
+`--label`, `--assignee`, and `--milestone`. Add `--quiet` for bare ids. No `gql` query is needed for any
+of them.
+
+### No Labels / Users / States / Milestones Returned
+
+**Symptom:** an enumeration command prints nothing, or stderr shows one of
+
+```
+labels list: invalid --team value
+milestone list: --project is required
+milestone list: project 'X' not found
+milestone list: project 'X' is ambiguous; pass the project id
+labels list: more labels available; pagination not implemented (endCursor XXX)
+```
+
+**Causes and fixes:**
+
+- `--team` filters `labels list` and `states list` on the team's key or id, so a workspace-level label
+  that belongs to no team is excluded by it — drop `--team` to see those. `users list` has no `--team`.
+- `users list` hides deactivated members by default. Add `--include-inactive` to see them.
+- `milestone list` **requires** `--project`, and a non-UUID value is matched against the project slug or
+  its exact name. Two matches is an error — take the id from `linear projects list --fields id,name`.
+- None of these commands paginate. The "more available" notice means the result was cut at `--limit`
+  (default 50); raise it or narrow the filter.
+
+```bash
+linear labels list --team TEAM_KEY --limit 100 --fields id,name --data-only
+linear users list --include-inactive --limit 100 --fields id,email,active --data-only
+linear states list --team TEAM_KEY --limit 50 --data-only
+linear milestone list --project "Roadmap" --limit 50 --data-only
 ```
 
 ### Issue Not Found
 
-**Symptom:** "Issue not found" when using `issue view`.
+**Symptom:** `issue view: issue not found`, or
+`issue view: invalid issue identifier; expected TEAM-NUMBER`.
 
 **Causes:**
-- Using UUID instead of identifier (or vice versa)
-- Issue was deleted
+- Malformed identifier — it must be `TEAM-NUMBER` (`ENG-123`) or a UUID/CUID
+- Issue was archived or deleted
 - No access to that issue
 
 **Solutions:**
 ```bash
-# Use identifier format (preferred)
-linear issue view ENG-123
+# Use identifier format (preferred); cheap existence check
+linear issue view ENG-123 --fields identifier,state --data-only
 
-# If you have UUID, it also works
-linear issue view "uuid-string-here"
+# If you have a UUID, it also works
+linear issue view "uuid-string-here" --fields identifier --data-only
 ```
+
+---
+
+## Branch Inference Errors
+
+`issue view`, `issue update`, `issue link`, `issue comment`, `issue comment list`, `issue start`,
+`issue pr`, and `issue id|url|title|describe` fall back to the current git branch when the identifier is
+omitted. When that fails, they say so and exit 1 rather than guessing:
+
+```
+issue view: branch 'main' has no issue identifier; pass one explicitly
+issue view: HEAD is detached; pass an issue identifier explicitly
+issue view: not a git repository; pass an issue identifier explicitly
+issue view: git was not found on PATH; pass an issue identifier explicitly
+```
+
+**Cause:** the branch name has to contain a leftmost `TEAM-123` match — the convention Linear's own
+`Issue.branchName` uses. `_` counts as a word character, so `feat_eng-123` does **not** match, and a
+leading zero is not a valid issue number, so `eng-0123` does **not** match. The team key is uppercased in
+the result (`eng-123` → `ENG-123`).
+
+**Solution:** pass the identifier explicitly, or check out a branch whose name carries it.
+
+```bash
+linear issue id            # what inference would resolve to; makes no API request
+git branch --show-current
+linear issue view ENG-123  # explicit, and always correct
+```
+
+`issue delete` never infers — it always needs an explicit target or a `--bulk*` source
+(`issue delete: missing identifier or id`).
+
+---
+
+## Content Flag Errors
+
+**Symptom:** stderr shows one of
+
+```
+issue create: cannot use both --description and --description-file
+issue create: file 'body.md' exceeds the 1048576 byte limit
+issue create: stdin exceeds the 1048576 byte limit
+issue create: cannot read file 'body.md': FileNotFound
+```
+
+**Cause:** every long-form flag has an inline form and a `-file` twin — `--description`/`--description-file`
+(`issue create`, `issue update`, `milestone create`, `milestone update`), `--body`/`--body-file`
+(`issue comment`, `issue comment update`), `--content`/`--content-file` (`project create`,
+`project update`). Supplying both is rejected rather than resolved by precedence, so a mistyped
+invocation can never quietly send the wrong content. The file/stdin cap is 1 MiB.
+
+**Solution:** pick one form. `-` reads stdin on every `--*-file` flag.
+
+```bash
+cat body.md | linear issue update ENG-123 --description-file - --yes --quiet
+linear project update PROJECT_ID --content-file overview.md --yes --quiet
+```
+
+Note that `--description` on `project create`/`project update` is capped at 255 characters by Linear
+itself; `--content`/`--content-file` is the uncapped long-form field.
 
 ---
 
@@ -106,27 +446,157 @@ linear issue view "uuid-string-here"
 
 ### Mutation Does Nothing
 
-**Symptom:** `issue create` or `issue delete` exits without action.
+**Symptom:** `issue create`, `issue update`, or `issue delete` produces no stdout and changes nothing.
 
-**Cause:** Mutations require explicit confirmation.
+**Cause:** Mutations require explicit confirmation. The refusal goes to stderr and exits 1:
 
-**Solution:** Add `--yes` flag:
+```
+issue create: confirmation required; re-run with --yes to proceed
+issue update: confirmation required; re-run with --yes to proceed
+issue delete: confirmation required; re-run with --yes to proceed
+```
+
+The same message is emitted by `issue link`, `issue comment`, `issue comment update|delete`,
+`issue start`, `issue pr`, `project create|update|delete`, `project add-issue|remove-issue`,
+`milestone create|update|delete`, and `gql` when the document declares a top-level `mutation`.
+
+**Solution:** Add `--yes` (alias `--force`):
 ```bash
-linear issue create --team OUT --title "Task" --yes
+linear issue create --team OUT --title "Task" --yes --quiet
 linear issue delete ENG-123 --yes
+linear gql --query /tmp/mutation.graphql --vars '{"id":"UUID"}' --yes
+```
+
+`gql --dry-run` prints what would be sent and exits 0 without a request, so it satisfies the gate by
+itself — use it to check a mutation document before adding `--yes`. Detection looks only at top-level
+tokens and skips `#` comments and string literals, so a field named `mutation` inside a selection set will
+not trigger the prompt, and a read-only query never needs `--yes`.
+
+`issue delete` calls the `issueDelete` mutation, which moves the issue to Linear's trash rather than
+hard-deleting it. Validate the target first with `--dry-run`, which resolves the issue, prints it, and
+exits 0 without mutating:
+
+```bash
+linear issue delete ENG-123 --dry-run
+linear milestone delete MILESTONE_ID --dry-run
 ```
 
 ### Missing Required Fields
 
-**Symptom:** "Missing required field" error on create.
-
-**Required fields for `issue create`:**
-- `--team` (team ID or key)
-- `--title` (issue title)
-- `--yes` (confirmation)
+**Required fields for `issue create`:** `--team` (id or key), `--title`, `--yes`.
 
 ```bash
-linear issue create --team OUT --title "My task" --yes
+linear issue create --team OUT --title "My task" --yes --quiet
+```
+
+**`issue update` with no field flags:**
+
+```
+issue update: at least one field to update is required
+```
+
+Supply at least one of `--assignee`, `--parent`, `--state`, `--priority`, `--title`, `--description`,
+`--description-file`, `--project`.
+
+**Required fields for `milestone create`:** `--project` (id, slug, or exact name), `--name`, `--yes`.
+
+```
+milestone create: --project is required
+milestone create: --name is required
+milestone update: provide at least one of --name, --description, --description-file, --target-date, or --sort-order
+```
+
+**`issue start` prerequisites:** the issue needs a Linear `branchName` and the team needs a workflow
+state of type `started`.
+
+```
+issue start: issue has no branchName; pass --branch NAME
+issue start: team has no workflow state of type 'started'
+issue start: branch 'X' already exists; --from-ref ignored
+issue start: git checkout failed for branch 'X'
+```
+
+The `--from-ref` notice is informational: an existing branch is checked out as-is and the base ref is
+ignored. `--branch` and `--from-ref` are validated before git is spawned — a value that is empty, starts
+with `-`, or contains whitespace/control characters is refused
+(`issue start: --branch must not start with '-'`).
+
+### Wrong Workflow State Name
+
+**Symptom:**
+
+```
+issue update: state 'started' not found; available states: Todo, In Progress, In Review, Done, Canceled
+```
+
+**Cause:** `issue update --state` takes a state **name** (case-insensitive) or a state id — not a state
+*type*. `started` is a type, valid only for `issues list --state-type`.
+
+**Solution:** Use one of the names the error lists verbatim: `linear issue update ENG-123 --state "In Progress" --yes`.
+
+### `--parent` Not Found
+
+**Symptom:** `issue update: issue 'ENG-100' not found`.
+
+**Cause:** `--parent` accepts an identifier *or* an id — the CLI resolves `ENG-100` through the same
+lookup as the positional argument before sending `parentId`. The error therefore means the parent does
+not exist or is not visible, not that the format was wrong.
+
+**Solution:** confirm the parent first, then set it.
+
+```bash
+linear issue view ENG-100 --fields identifier,state --data-only
+linear issue update ENG-123 --parent ENG-100 --yes
+```
+
+### Comment Body Comes Back Mangled
+
+**Symptom:** a comment read through `issue comment list` has lost its line breaks.
+
+**Cause:** table output and tab-separated `--data-only` output are single-line records, so `\r`, `\n`,
+and `\t` inside a body are folded to spaces. This is display formatting, not data loss at the source.
+
+**Solution:** read bodies as JSON — verbatim there, including with `--data-only --json`.
+
+```bash
+linear issue comment list ENG-123 --limit 20 --json | jq -r '.issue.comments.nodes[].body'
+linear issue comment list ENG-123 --limit 20 --fields id,body --data-only --json
+```
+
+---
+
+## Bulk Delete Errors
+
+`issue delete` and `milestone delete` accept `--bulk ID,ID`, `--bulk-file PATH`, and `--bulk-stdin`.
+
+**Symptom:** stderr shows one of
+
+```
+issue delete: use only one of --bulk, --bulk-file, or --bulk-stdin
+issue delete: bulk input contained no ids
+issue delete: bulk input has 900 ids; the limit is 500
+issue delete: pass an identifier or --bulk, not both
+milestone delete: pass a milestone id or --bulk, not both
+issue delete: bulk complete; 3 succeeded, 1 failed
+```
+
+**Behavior to expect:**
+
+- Execution is **serial**, in input order. Ids are deduplicated keeping first-seen order, so the same
+  destructive mutation is never sent twice.
+- Input is split on commas and ASCII whitespace, so `--bulk a,b` and a newline-delimited file both work.
+- The batch is capped at 500 ids; the bulk source is read and validated **before** any network call.
+- A failed item is counted and the run **continues**. The final line is a summary, and the exit code is
+  non-zero when anything failed.
+- The summary is suppressed under `--json`, where stdout is a streamed JSON array instead — the exit
+  code is then the only failure signal.
+
+**Solution:** dry-run first (no `--yes` needed, nothing is sent), then check `$?`.
+
+```bash
+linear issues list --team TEAM_KEY --limit 25 --quiet | linear issue delete --bulk-stdin --dry-run
+linear issue delete --bulk ENG-1,ENG-2 --yes --quiet
+echo $?
 ```
 
 ---
@@ -135,12 +605,81 @@ linear issue create --team OUT --title "My task" --yes
 
 ### Invalid Query Syntax
 
-**Symptom:** GraphQL syntax error.
+**Symptom:** `gql: Syntax Error: ...` on stderr, exit 1.
 
 **Solutions:**
-1. Validate query in [Apollo Studio](https://studio.apollographql.com/public/Linear-API/variant/current/explorer)
-2. Check for missing braces or typos
-3. Ensure variable types match schema
+1. Check for missing braces or typos
+2. Ensure variable types match the schema — confirm with the introspection recipes in
+   `graphql-recipes.md` → "Schema Introspection"
+3. Put the query in a file and pass `--query FILE` to avoid shell-quoting damage:
+   ```bash
+   cat > /tmp/q.graphql << 'EOF'
+   query Viewer { viewer { id name } }
+   EOF
+   linear gql --query /tmp/q.graphql --data-only
+   ```
+
+### `gql` Flag Conflicts
+
+```
+gql: only one of --vars or --vars-file may be provided
+gql: cannot use both --query and inline query argument
+```
+
+Pick one form for each.
+
+### `gql: response did not include a data field`
+
+The query errored, and `--data-only` suppressed the `errors` array. Re-run without `--data-only` to see it.
+
+### `gql: requested field not found in response`
+
+`--fields` names a key that is not a top-level key of the payload. `gql --fields` selects top-level keys of
+the response object — it is not the same projection vocabulary as `issues list --fields`.
+
+### `--paginate` Rejected Before Any Request
+
+**Symptom:** one of
+
+```
+gql: --paginate cannot be used with a mutation document
+gql: --paginate requires the query to declare an $after variable
+gql: --paginate requires the query to select pageInfo { hasNextPage endCursor }
+gql: --paginate requires variables to be a JSON object
+gql: invalid --max-pages value
+```
+
+**Cause:** the walk is validated up front — before the first request and before an API key is even
+required — so a query that cannot be paginated fails immediately instead of quietly returning page one.
+The document must be read-only, declare `$after` and pass it to the connection, and select all three of
+`pageInfo`, `hasNextPage`, `endCursor`. `--vars` must be a JSON object so the cursor can be merged in.
+
+**Solution:**
+
+```bash
+linear gql --paginate --max-pages 5 --data-only '
+query TeamIssues($after: String) {
+  issues(first: 50, after: $after) {
+    nodes { identifier title }
+    pageInfo { hasNextPage endCursor }
+  }
+}'
+```
+
+### `--paginate` Failures Mid-Walk
+
+```
+gql: --paginate found no connection selecting both 'nodes' and 'pageInfo' in the response
+gql: --paginate lost the connection on page 3
+gql: --paginate found no 'nodes' array on page 3
+gql: --paginate needs an endCursor to continue but the page did not return one
+gql: --paginate stopped after 20 pages (--max-pages 20); more results remain
+```
+
+The connection to walk is discovered breadth-first, so the **shallowest** one wins and a connection
+nested inside an array is never chosen. The last message is not an error — `--max-pages` defaults to 20
+and merged results up to that point are still printed. A page that returns an HTTP or GraphQL error
+stops the walk and is reported exactly as an unpaginated run would report it.
 
 ### Variable Type Mismatch
 
@@ -165,7 +704,21 @@ linear issue create --team OUT --title "My task" --yes
 
 **Cause:** Field doesn't exist or is named differently.
 
-**Solution:** Check schema in [Apollo Studio](https://studio.apollographql.com/public/Linear-API/variant/current/schema/reference).
+**Solution:** Introspect the type. There is no `linear schema` command — write the introspection result to
+a temp file and grep it:
+
+```bash
+linear gql --data-only --vars '{"name":"Issue"}' '
+query TypeFields($name: String!) {
+  __type(name: $name) { fields { name type { name kind ofType { name kind } } } }
+}' > /tmp/linear-type-Issue.json
+
+grep -n '"name"' /tmp/linear-type-Issue.json
+```
+
+Omit `--json` so the output stays pretty-printed and greppable; `--json` minifies it onto one line.
+For mutation inputs, query `inputFields` instead of `fields` — see `graphql-recipes.md` →
+"Schema Introspection".
 
 ---
 
@@ -173,16 +726,50 @@ linear issue create --team OUT --title "My task" --yes
 
 ### Timeout
 
-**Symptom:** Request times out.
+**Symptom:** `<cmd>: request timed out after 10000ms` (10000 ms is the default).
 
 **Solutions:**
 ```bash
 # Increase timeout (milliseconds)
-linear issues list --timeout-ms 30000
+linear issues list --team TEAM --limit 20 --sub-limit 0 --timeout-ms 30000
 
-# Retry on failure
-linear issues list --retries 3
+# Retry on failure (retries apply to 5xx only; default 0)
+linear issues list --team TEAM --limit 20 --sub-limit 0 --retries 3
+
+# Or shrink the request — often the real fix
+linear issues list --limit 10 --sub-limit 0 --fields identifier,title
 ```
+
+### Rate Limited
+
+**Symptom:**
+
+```
+<cmd>: HTTP status 429
+<cmd>: rate limit: remaining 0/1500; reset in ~42000ms
+```
+
+**Solution:** wait for the printed reset window. Reduce request volume with `--limit`, `--max-items`, and
+`--sub-limit 0` rather than retrying immediately.
+
+### Rejected `--endpoint`
+
+**Symptom:** the command exits 1 before any request, with one of
+
+```
+linear: --endpoint rejected: endpoint must use https; set LINEAR_ALLOW_INSECURE_ENDPOINT=1 to allow other schemes
+linear: --endpoint rejected: endpoint host must be api.linear.app; set LINEAR_ALLOW_INSECURE_ENDPOINT=1 to allow other hosts
+linear: --endpoint rejected: endpoint must be an absolute URL with a host
+```
+
+**Cause:** `--endpoint` is allowlisted. Every request carries the API key in an `Authorization` header, so
+the URL is checked before a connection is opened: it must use `https` and resolve to host
+`api.linear.app`. Look-alikes are rejected too — `https://api.linear.app.evil.example.com/graphql` and
+`https://api.linear.app@evil.example.com/graphql` both fail the host check.
+
+**Solution:** drop `--endpoint`; the default (`https://api.linear.app/graphql`) is what you want. Only a
+mock/QA server needs `LINEAR_ALLOW_INSECURE_ENDPOINT=1` (the literal `1`, nothing else), and even then the
+value must still parse as a URL with a host.
 
 ### Network Errors
 
@@ -199,10 +786,13 @@ linear issues list --retries 3
 
 ### Step 1: Verify Authentication
 ```bash
-linear auth test
+linear auth status   # which backend, and is the key usable — never prints the key
+linear auth test     # does the key actually authenticate
 ```
 
-Expected: Shows your user info.
+Expected: `auth status` exits 0 and names a source; `auth test` shows your user info. If `auth status`
+reports `source: credential_helper (failed)`, stop here — nothing downstream will work until the helper is
+fixed or unset.
 
 ### Step 2: Check Team Access
 ```bash
@@ -220,23 +810,44 @@ Should show your user details.
 
 ### Step 4: Check Issue Exists
 ```bash
-linear issue view ISSUE-ID --json
+linear issue view ISSUE-ID --fields identifier,state --data-only
 ```
 
 ### Step 5: Enable Verbose Output
 ```bash
-# Get full JSON response
-linear issues list --team TEAM --json
+# Get full JSON response (bound it — --all/--pages multiply the cost)
+linear issues list --team TEAM --limit 10 --sub-limit 0 --json
 
-# For GraphQL, check raw response
+# For GraphQL, check the raw response including the errors array
 echo 'query { viewer { id } }' | linear gql --json
 ```
 
-### Step 6: Validate GraphQL in Studio
+### Step 6: Confirm the Command's Own Flag Set
 
-1. Go to [Apollo Studio Explorer](https://studio.apollographql.com/public/Linear-API/variant/current/explorer)
-2. Add header: `Authorization: YOUR_API_KEY`
-3. Test your query interactively
+Before assuming a flag is broken, confirm it exists. Every command's usage block ends with an
+`Examples:` section (the only exceptions are `linear help config` and `linear help config show`):
+
+```bash
+linear help issues
+linear help issue view
+linear help issue comment list
+linear help issue start
+linear help labels          # also: users, states
+linear help milestone       # all five subcommands in one block
+linear help search
+linear help gql
+```
+
+`search: unknown flag` and `issues list: unknown flag` mean the flag does not exist on that command —
+`--plain`, `--no-truncate`, `--quiet`, and `--data-only` are **not** accepted by `search`, and
+`--comment-limit` exists only on `issue view`. Likewise `--team` does not exist on `users list`,
+`--include-inactive` exists only there, `--bulk*` exists only on `issue delete` and `milestone delete`,
+and `--paginate`/`--max-pages` exist only on `gql`.
+
+### Step 7: Introspect the Schema
+
+For anything `gql`-related, dump the relevant type to a temp file and grep it — see
+`graphql-recipes.md` → "Schema Introspection". No browser or external explorer is needed.
 
 ---
 
@@ -247,14 +858,36 @@ Config is stored at `~/.config/linear/config.json`.
 
 ### Check Current Config
 ```bash
-cat ~/.config/linear/config.json
+linear config show
+```
+
+Prints `config_path`, `default_team_id`, `default_output`, `default_state_filter`, and the
+`credential_helper` argv — never the API key. Do not `cat` the config file: if the deprecated `api_key`
+field is still there it holds the key in cleartext, and dumping it puts a live credential into the
+transcript. `linear auth status` answers which backend the key comes from without printing it, and
+`file_api_key: present (deprecated plaintext)` in that output is what tells you the file still holds one.
+
+`credential_helper` can be **unset** here but not set — `linear auth migrate --to helper <command>` is the
+only writer, because it verifies the helper before storing it:
+
+```bash
+linear config unset credential_helper
 ```
 
 ### Reset Config
 ```bash
 rm ~/.config/linear/config.json
-linear auth set
+linear auth status
 ```
+
+Removing the file drops `credential_helper` along with the defaults, so re-point the helper afterwards
+(`linear auth migrate --to helper ...` needs a key in the config file, so set the helper up before
+resetting, or use `LINEAR_API_KEY` in the meantime). A **keychain** item is not stored in the config file
+and survives the delete — on macOS `linear auth status` may well still report `source: keychain` with no
+config file at all.
+
+Deleting the file is not a secure erase of a key it contained — see
+[Moving a Plaintext Key Off Disk](#moving-a-plaintext-key-off-disk) and rotate the key.
 
 ### Permission Issues
 Config should have mode 0600. If warnings appear:
