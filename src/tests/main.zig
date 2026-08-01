@@ -13148,3 +13148,69 @@ test "auth migrate flag parsing rejects unknown backends and flags" {
     try std.testing.expectEqual(@as(usize, 5), parsed.helper_argv.len);
     try std.testing.expectEqualStrings("--fields", parsed.helper_argv[3]);
 }
+
+test "issues list --sort sends sort without orderBy" {
+    // Regression: the command used to send BOTH `orderBy` and `sort`, and Linear
+    // rejects that combination with "Cannot use both sort and orderBy options",
+    // so `issues list --sort` failed against the real API. Every mock test passed
+    // because the mock returns a canned response regardless of the variables sent
+    // -- this was only caught by the live e2e run. `sort` is the richer input
+    // (IssueSortInput carries the direction; PaginationOrderBy carries only the
+    // field), so `orderBy` is now left unset.
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("Issues", fixtures.issues_response);
+    try server.set("TeamLookup", fixtures.issue_create_team_lookup);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    const Runner = struct {
+        allocator: std.mem.Allocator,
+        cfg: *config.Config,
+    };
+    const runIssues = struct {
+        pub fn call(r: *const Runner) !u8 {
+            var args = [_][]const u8{ "--limit", "1", "--sort", "updated:desc" };
+            return issues_cmd.run(.{
+                .allocator = r.allocator,
+                .io = test_io,
+                .config = r.cfg,
+                .args = args[0..],
+                .retries = 0,
+                .timeout_ms = 10_000,
+                .json_output = true,
+            });
+        }
+    }.call;
+    const runner = Runner{ .allocator = allocator, .cfg = &cfg };
+
+    const capture = try captureOutput(allocator, &runner, runIssues);
+    defer capture.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars_json = recorded.variables_json orelse return error.TestExpectedResult;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, vars_json, .{});
+    defer parsed.deinit();
+    const vars_root = parsed.value;
+    if (vars_root != .object) return error.TestExpectedResult;
+
+    // The whole point: orderBy must be absent.
+    try std.testing.expect(vars_root.object.get("orderBy") == null);
+
+    // ...and sort must still carry field and direction.
+    const sort_value = vars_root.object.get("sort") orelse return error.TestExpectedResult;
+    if (sort_value != .array) return error.TestExpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), sort_value.array.items.len);
+    const entry = sort_value.array.items[0];
+    if (entry != .object) return error.TestExpectedResult;
+    const updated = entry.object.get("updatedAt") orelse return error.TestExpectedResult;
+    if (updated != .object) return error.TestExpectedResult;
+    const order = updated.object.get("order") orelse return error.TestExpectedResult;
+    try std.testing.expectEqualStrings("Descending", order.string);
+}

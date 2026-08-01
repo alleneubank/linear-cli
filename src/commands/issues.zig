@@ -861,7 +861,11 @@ fn buildVariables(
         var sort_array = std.json.Array.init(allocator);
         try sort_array.append(sort_entry);
 
-        try vars.object.put(allocator, "orderBy", .{ .string = field_name });
+        // Only `sort` is sent. Linear rejects a request carrying both with
+        // "Cannot use both sort and orderBy options", and `sort` is strictly
+        // richer -- IssueSortInput carries the direction, PaginationOrderBy
+        // carries only the field. Leaving $orderBy unset lets the server apply
+        // its default.
         try vars.object.put(allocator, "sort", .{ .array = sort_array });
     }
     return vars;
