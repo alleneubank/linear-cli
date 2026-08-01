@@ -13313,6 +13313,427 @@ test "issues list --sort rejects an unknown field before any request" {
     try std.testing.expectError(error.InvalidSort, issues_cmd.parseOptions(extra_suffix[0..]));
 }
 
+/// One `--sort` / `--sort-nulls` invocation and the `*Sort` object it must
+/// produce. `nulls == null` means the flag is not passed at all, and then
+/// `expected_nulls == null` asserts the key is absent from the wire -- the
+/// compatibility guarantee, which a default value would not express.
+const SortNullsWireCase = struct {
+    sort: []const u8,
+    nulls: ?[]const u8,
+    key: []const u8,
+    order: []const u8,
+    expected_nulls: ?[]const u8,
+};
+
+/// Runs `issues list --sort <case.sort> [--sort-nulls <case.nulls>]` against the
+/// mock and asserts the sort object that actually went out.
+fn expectIssuesSortNullsVariable(
+    allocator: std.mem.Allocator,
+    server: *mock_graphql.MockServer,
+    cfg: *config.Config,
+    case: SortNullsWireCase,
+) !void {
+    const Runner = struct {
+        allocator: std.mem.Allocator,
+        cfg: *config.Config,
+        sort: []const u8,
+        nulls: ?[]const u8,
+    };
+    const runIssues = struct {
+        pub fn call(r: *const Runner) !u8 {
+            var argv: [6][]const u8 = undefined;
+            argv[0] = "--limit";
+            argv[1] = "1";
+            argv[2] = "--sort";
+            argv[3] = r.sort;
+            var argc: usize = 4;
+            if (r.nulls) |value| {
+                argv[4] = "--sort-nulls";
+                argv[5] = value;
+                argc = 6;
+            }
+            return issues_cmd.run(.{
+                .allocator = r.allocator,
+                .io = test_io,
+                .config = r.cfg,
+                .args = argv[0..argc],
+                .retries = 0,
+                .timeout_ms = 10_000,
+                .json_output = true,
+            });
+        }
+    }.call;
+    const runner = Runner{ .allocator = allocator, .cfg = cfg, .sort = case.sort, .nulls = case.nulls };
+
+    const capture = try captureOutput(allocator, &runner, runIssues);
+    defer capture.deinit(allocator);
+    if (capture.exit_code != 0) {
+        std.debug.print(
+            "issues list --sort {s} --sort-nulls {s} stderr: {s}\n",
+            .{ case.sort, case.nulls orelse "(unset)", capture.stderr },
+        );
+    }
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars_json = recorded.variables_json orelse return error.TestExpectedResult;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, vars_json, .{});
+    defer parsed.deinit();
+    const vars_root = parsed.value;
+    if (vars_root != .object) return error.TestExpectedResult;
+
+    // Null placement does not change the no-orderBy invariant.
+    try std.testing.expect(vars_root.object.get("orderBy") == null);
+
+    const sort_value = vars_root.object.get("sort") orelse return error.TestExpectedResult;
+    if (sort_value != .array) return error.TestExpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), sort_value.array.items.len);
+    const entry = sort_value.array.items[0];
+    if (entry != .object) return error.TestExpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), entry.object.count());
+    const detail = entry.object.get(case.key) orelse return error.TestExpectedResult;
+    if (detail != .object) return error.TestExpectedResult;
+
+    // `order` keeps its capitalised PaginationSortOrder spelling either way.
+    const order = detail.object.get("order") orelse return error.TestExpectedResult;
+    if (order != .string) return error.TestExpectedResult;
+    try std.testing.expectEqualStrings(case.order, order.string);
+
+    if (case.expected_nulls) |want| {
+        // `nulls` sits beside `order` in the same object -- exactly two keys.
+        try std.testing.expectEqual(@as(usize, 2), detail.object.count());
+        const nulls = detail.object.get("nulls") orelse return error.TestExpectedResult;
+        if (nulls != .string) return error.TestExpectedResult;
+        try std.testing.expectEqualStrings(want, nulls.string);
+        // PaginationNulls is lowercase even though PaginationSortOrder is not;
+        // `First` is rejected by the API, so casing is asserted directly.
+        for (nulls.string) |ch| try std.testing.expect(!std.ascii.isUpper(ch));
+    } else {
+        // Absence, not a default: an omitted flag must leave the request byte
+        // for byte what it was before `--sort-nulls` existed.
+        try std.testing.expect(detail.object.get("nulls") == null);
+        try std.testing.expectEqual(@as(usize, 1), detail.object.count());
+    }
+
+    // The --json echo reports what was sent.
+    var echo = try std.json.parseFromSlice(std.json.Value, allocator, capture.stdout, .{});
+    defer echo.deinit();
+    if (echo.value != .object) return error.TestExpectedResult;
+    const echo_sort = echo.value.object.get("sort") orelse return error.TestExpectedResult;
+    if (echo_sort != .object) return error.TestExpectedResult;
+    if (case.expected_nulls) |want| {
+        const echoed = echo_sort.object.get("nulls") orelse return error.TestExpectedResult;
+        try std.testing.expectEqualStrings(want, echoed.string);
+    } else {
+        try std.testing.expect(echo_sort.object.get("nulls") == null);
+    }
+}
+
+test "issues list --sort-nulls sends nulls beside order" {
+    // `nulls: PaginationNulls` is the second key every `*Sort` input carries.
+    // Both placements are checked against both directions because the two are
+    // independent: `dueDate:asc --sort-nulls last` (soonest deadline first,
+    // undated issues out of the way) and `dueDate:desc --sort-nulls first` are
+    // different requests, and the flag must not quietly imply a direction.
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("Issues", fixtures.issues_response);
+    try server.set("TeamLookup", fixtures.issue_create_team_lookup);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    const cases = [_]SortNullsWireCase{
+        .{ .sort = "dueDate:asc", .nulls = "last", .key = "dueDate", .order = "Ascending", .expected_nulls = "last" },
+        .{ .sort = "dueDate:desc", .nulls = "last", .key = "dueDate", .order = "Descending", .expected_nulls = "last" },
+        .{ .sort = "dueDate:asc", .nulls = "first", .key = "dueDate", .order = "Ascending", .expected_nulls = "first" },
+        .{ .sort = "dueDate:desc", .nulls = "first", .key = "dueDate", .order = "Descending", .expected_nulls = "first" },
+        // Frequently-null fields other than dueDate get the same treatment.
+        .{ .sort = "completedAt:asc", .nulls = "last", .key = "completedAt", .order = "Ascending", .expected_nulls = "last" },
+        .{ .sort = "cycle", .nulls = "first", .key = "cycle", .order = "Descending", .expected_nulls = "first" },
+        .{ .sort = "customerRevenue:asc", .nulls = "last", .key = "customerRevenue", .order = "Ascending", .expected_nulls = "last" },
+        // The alias fields carry it too.
+        .{ .sort = "updated:asc", .nulls = "first", .key = "updatedAt", .order = "Ascending", .expected_nulls = "first" },
+        // Input casing is free; the wire value is not.
+        .{ .sort = "dueDate:asc", .nulls = "LAST", .key = "dueDate", .order = "Ascending", .expected_nulls = "last" },
+        .{ .sort = "dueDate:asc", .nulls = "First", .key = "dueDate", .order = "Ascending", .expected_nulls = "first" },
+        .{ .sort = "slaStatus:desc", .nulls = "LaSt", .key = "slaStatus", .order = "Descending", .expected_nulls = "last" },
+    };
+    for (cases) |case| try expectIssuesSortNullsVariable(allocator, &server, &cfg, case);
+}
+
+test "issues list --sort without --sort-nulls sends no nulls key" {
+    // The compatibility guarantee. Every invocation that predates the flag must
+    // keep getting the server's default placement, which means the request has
+    // to stay exactly as it was -- no `nulls` key, not a `nulls` key holding
+    // whatever the CLI thinks the default is.
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("Issues", fixtures.issues_response);
+    try server.set("TeamLookup", fixtures.issue_create_team_lookup);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    const cases = [_]SortNullsWireCase{
+        .{ .sort = "dueDate:asc", .nulls = null, .key = "dueDate", .order = "Ascending", .expected_nulls = null },
+        .{ .sort = "updated:desc", .nulls = null, .key = "updatedAt", .order = "Descending", .expected_nulls = null },
+        .{ .sort = "priority", .nulls = null, .key = "priority", .order = "Descending", .expected_nulls = null },
+    };
+    for (cases) |case| try expectIssuesSortNullsVariable(allocator, &server, &cfg, case);
+
+    // And the option itself defaults to unset, so there is nothing to emit.
+    const args = [_][]const u8{ "--sort", "dueDate:asc" };
+    const opts = try issues_cmd.parseOptions(args[0..]);
+    try std.testing.expect(opts.sort_nulls == null);
+}
+
+test "issues list --sort-nulls parses both placements case-insensitively" {
+    const Case = struct {
+        input: []const u8,
+        tag: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .input = "first", .tag = "first" },
+        .{ .input = "last", .tag = "last" },
+        .{ .input = "FIRST", .tag = "first" },
+        .{ .input = "LAST", .tag = "last" },
+        .{ .input = "First", .tag = "first" },
+        .{ .input = "LaSt", .tag = "last" },
+    };
+
+    for (cases) |case| {
+        const args = [_][]const u8{ "--sort", "dueDate:asc", "--sort-nulls", case.input };
+        const opts = try issues_cmd.parseOptions(args[0..]);
+        try std.testing.expect(opts.sort_nulls != null);
+        try std.testing.expectEqualStrings(case.tag, @tagName(opts.sort_nulls.?));
+        // The parsed field is unaffected.
+        try std.testing.expectEqualStrings("dueDate", @tagName(opts.sort.?.field));
+        try std.testing.expectEqualStrings("asc", @tagName(opts.sort.?.direction));
+    }
+
+    // The `=` spelling works the same.
+    const inline_args = [_][]const u8{ "--sort=dueDate:asc", "--sort-nulls=LAST" };
+    const inline_opts = try issues_cmd.parseOptions(inline_args[0..]);
+    try std.testing.expectEqualStrings("last", @tagName(inline_opts.sort_nulls.?));
+
+    // ...and so does the reverse flag order, which is why the setting is not
+    // stored inside the value `--sort` parses.
+    const reversed = [_][]const u8{ "--sort-nulls", "first", "--sort", "dueDate:asc" };
+    const reversed_opts = try issues_cmd.parseOptions(reversed[0..]);
+    try std.testing.expectEqualStrings("first", @tagName(reversed_opts.sort_nulls.?));
+    try std.testing.expectEqualStrings("dueDate", @tagName(reversed_opts.sort.?.field));
+}
+
+test "issues list --sort-nulls without --sort fails before any request" {
+    // `nulls` only exists inside a sort object, so on its own the flag has
+    // nowhere to go. Silently ignoring it would look like it worked.
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    // Available on purpose -- the point is that it goes unused.
+    try server.set("Issues", fixtures.issues_response);
+    try server.set("TeamLookup", fixtures.issue_create_team_lookup);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    const Runner = struct {
+        allocator: std.mem.Allocator,
+        cfg: *config.Config,
+    };
+    const runIssues = struct {
+        pub fn call(r: *const Runner) !u8 {
+            var args = [_][]const u8{ "--limit", "1", "--sort-nulls", "last" };
+            return issues_cmd.run(.{
+                .allocator = r.allocator,
+                .io = test_io,
+                .config = r.cfg,
+                .args = args[0..],
+                .retries = 0,
+                .timeout_ms = 10_000,
+                .json_output = true,
+            });
+        }
+    }.call;
+    const runner = Runner{ .allocator = allocator, .cfg = &cfg };
+
+    const capture = try captureOutput(allocator, &runner, runIssues);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr, "issues list: --sort-nulls requires --sort\n"));
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+
+    // Same verdict at the parser, in both flag spellings.
+    const spaced = [_][]const u8{ "--sort-nulls", "last" };
+    try std.testing.expectError(error.SortNullsRequiresSort, issues_cmd.parseOptions(spaced[0..]));
+    const inline_form = [_][]const u8{"--sort-nulls=first"};
+    try std.testing.expectError(error.SortNullsRequiresSort, issues_cmd.parseOptions(inline_form[0..]));
+}
+
+test "issues list --sort-nulls rejects an unknown value before any request" {
+    // Validation is local and lists the alternatives, exactly like --sort.
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("Issues", fixtures.issues_response);
+    try server.set("TeamLookup", fixtures.issue_create_team_lookup);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    const Runner = struct {
+        allocator: std.mem.Allocator,
+        cfg: *config.Config,
+    };
+    const runIssues = struct {
+        pub fn call(r: *const Runner) !u8 {
+            // Plausible, and wrong: PaginationNulls has only first and last.
+            var args = [_][]const u8{ "--limit", "1", "--sort", "dueDate:asc", "--sort-nulls", "nulls-last" };
+            return issues_cmd.run(.{
+                .allocator = r.allocator,
+                .io = test_io,
+                .config = r.cfg,
+                .args = args[0..],
+                .retries = 0,
+                .timeout_ms = 10_000,
+                .json_output = true,
+            });
+        }
+    }.call;
+    const runner = Runner{ .allocator = allocator, .cfg = &cfg };
+
+    const capture = try captureOutput(allocator, &runner, runIssues);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr, "issues list: invalid --sort-nulls value\n"));
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "valid --sort-nulls values: first, last") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "--sort-nulls requires --sort") != null);
+    // Nothing was sent: the typo cost no request.
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+
+    // The shapes that can go wrong, at the parser.
+    const unknown = [_][]const u8{ "--sort", "dueDate", "--sort-nulls", "nulls-last" };
+    try std.testing.expectError(error.InvalidSortNulls, issues_cmd.parseOptions(unknown[0..]));
+    const empty = [_][]const u8{ "--sort", "dueDate", "--sort-nulls", "" };
+    try std.testing.expectError(error.InvalidSortNulls, issues_cmd.parseOptions(empty[0..]));
+    // The PaginationSortOrder vocabulary is not this flag's vocabulary.
+    const wrong_enum = [_][]const u8{ "--sort", "dueDate", "--sort-nulls", "Ascending" };
+    try std.testing.expectError(error.InvalidSortNulls, issues_cmd.parseOptions(wrong_enum[0..]));
+    const missing_value = [_][]const u8{ "--sort", "dueDate", "--sort-nulls" };
+    try std.testing.expectError(error.MissingValue, issues_cmd.parseOptions(missing_value[0..]));
+}
+
+test "issues list --data-only --json echoes the nulls setting" {
+    // The second echo site: --data-only builds its own root object, so the
+    // sort report has to be kept in step there too.
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("Issues", fixtures.issues_response);
+    try server.set("TeamLookup", fixtures.issue_create_team_lookup);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    const Runner = struct {
+        allocator: std.mem.Allocator,
+        cfg: *config.Config,
+        nulls: ?[]const u8,
+    };
+    const runIssues = struct {
+        pub fn call(r: *const Runner) !u8 {
+            var argv: [7][]const u8 = undefined;
+            argv[0] = "--limit";
+            argv[1] = "1";
+            argv[2] = "--data-only";
+            argv[3] = "--sort";
+            argv[4] = "dueDate:asc";
+            var argc: usize = 5;
+            if (r.nulls) |value| {
+                argv[5] = "--sort-nulls";
+                argv[6] = value;
+                argc = 7;
+            }
+            return issues_cmd.run(.{
+                .allocator = r.allocator,
+                .io = test_io,
+                .config = r.cfg,
+                .args = argv[0..argc],
+                .retries = 0,
+                .timeout_ms = 10_000,
+                .json_output = true,
+            });
+        }
+    }.call;
+
+    {
+        const runner = Runner{ .allocator = allocator, .cfg = &cfg, .nulls = "last" };
+        const capture = try captureOutput(allocator, &runner, runIssues);
+        defer capture.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, capture.stdout, .{});
+        defer parsed.deinit();
+        const sort_obj = parsed.value.object.get("sort") orelse return error.TestExpectedResult;
+        try std.testing.expectEqualStrings("dueDate", sort_obj.object.get("field").?.string);
+        try std.testing.expectEqualStrings("asc", sort_obj.object.get("direction").?.string);
+        try std.testing.expectEqualStrings("last", sort_obj.object.get("nulls").?.string);
+    }
+
+    {
+        // Omitted here as well: the echo must not invent a value either.
+        const runner = Runner{ .allocator = allocator, .cfg = &cfg, .nulls = null };
+        const capture = try captureOutput(allocator, &runner, runIssues);
+        defer capture.deinit(allocator);
+        try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, capture.stdout, .{});
+        defer parsed.deinit();
+        const sort_obj = parsed.value.object.get("sort") orelse return error.TestExpectedResult;
+        try std.testing.expectEqualStrings("dueDate", sort_obj.object.get("field").?.string);
+        try std.testing.expect(sort_obj.object.get("nulls") == null);
+    }
+}
+
+test "issues list usage documents --sort-nulls" {
+    const allocator = std.testing.allocator;
+
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer buffer.deinit();
+    try issues_cmd.usage(&buffer.writer);
+
+    const text = buffer.written();
+    // The signature line advertises the choices...
+    const first_line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    try std.testing.expect(std.mem.indexOf(u8, text[0..first_line_end], "[--sort-nulls first|last]") != null);
+    // ...the flag block names them and the requirement...
+    try std.testing.expect(std.mem.indexOf(u8, text, "--sort-nulls WHERE") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "first, last") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Requires --sort") != null);
+    // ...and the worked example is the case that motivates the flag.
+    try std.testing.expect(std.mem.indexOf(u8, text, "--sort dueDate:asc --sort-nulls last") != null);
+}
+
 test "issues list usage lists the sortable fields" {
     const allocator = std.testing.allocator;
 

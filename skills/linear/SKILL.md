@@ -631,8 +631,15 @@ linear issues list --team TEAM_KEY --created-since 2026-07-01T00:00:00Z \
 # Highest priority first (any IssueSortInput field works, e.g. dueDate, manual, workflowState)
 linear issues list --team TEAM_KEY --sort priority:asc --limit 20 --sub-limit 0
 
-# Soonest due date first; issues with no due date fall wherever Linear puts them
-linear issues list --team TEAM_KEY --sort dueDate:asc --limit 20 --sub-limit 0
+# Soonest due date first, undated issues pushed to the end.
+# Without --sort-nulls, a bounded page can be entirely issues with no due date
+# before the first real deadline shows up -- most sortable fields are routinely
+# null (dueDate, completedAt, cycle, milestone, slaStatus, delegate, release,
+# and every customer* field on a non-customer issue).
+linear issues list --team TEAM_KEY --sort dueDate:asc --sort-nulls last --limit 20 --sub-limit 0
+
+# The other direction: surface the issues still missing a due date
+linear issues list --team TEAM_KEY --sort dueDate:asc --sort-nulls first --limit 20 --sub-limit 0
 ```
 
 ### Create an issue
@@ -936,6 +943,15 @@ Per-command flags worth knowing:
   remain aliases for `createdAt`/`updatedAt`. Direction defaults to `desc`. Unknown names are rejected
   locally — no request is sent — with `issues list: invalid --sort value` followed by the list of valid
   fields; `linear help issues` prints the same list
+- `--sort-nulls first|last` — `issues list` only, and only alongside `--sort`. Places issues that have no
+  value for the sort field. Reach for it whenever the sort field is one of the routinely-null ones
+  (`dueDate`, `completedAt`, `cycle`, `milestone`, `slaStatus`, `delegate`, `release`, any `customer*`):
+  with a bounded `--limit`, the nulls can consume the whole page. `--sort dueDate:asc --sort-nulls last`
+  is "soonest deadline first, undated last"; `--sort-nulls first` surfaces the undated ones instead.
+  Matched case-insensitively. Omit it and null placement is left to Linear's default — nothing is sent,
+  so the results are identical to not knowing the flag exists. `--sort-nulls` without `--sort` fails with
+  `issues list: --sort-nulls requires --sort`, and an unknown value fails locally with the valid values
+  printed; neither costs a request
 - `--yes` — required for every mutation, including a `mutation` document passed to `gql` (alias: `--force`).
   `issue comment update|delete`, `issue start`, `issue pr`, and `milestone create|update|delete` are
   gated the same way
@@ -1006,6 +1022,8 @@ not redirect stderr away.
 | `issues list: no fields selected` | `--fields` resolved to an empty set |
 | `issues list: invalid --max-items value` | `--max-items 0` is rejected; omit the flag instead |
 | `issues list: invalid --sort value` | `--sort` takes an `IssueSortInput` field (plus the `created`/`updated` aliases), optionally suffixed `:asc`/`:desc`. The next two stderr lines list every accepted field; `linear help issues` prints the same list |
+| `issues list: invalid --sort-nulls value` | Null placement is `first` or `last` only — the next stderr line lists them. It is not a `--sort` suffix segment and not the `Ascending`/`Descending` vocabulary |
+| `issues list: --sort-nulls requires --sort` | `nulls` only exists inside a sort object. Add the `--sort FIELD` the placement applies to, or drop `--sort-nulls` |
 | `issue delete: UnknownFlag` on `--reason` | `--reason` was removed — `issueDelete` has no reason parameter, so it never reached Linear. Record it on your side, or leave a comment on the issue before deleting |
 | `issues list: fetched N items across M pages; more available, resume with --cursor XXX` | Not an error — pass `--cursor XXX`, or `--pages N` / `--all` |
 | `issues list: stopped after N items due to --max-items` | Not an error — raise `--max-items` if you need more |

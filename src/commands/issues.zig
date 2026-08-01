@@ -113,6 +113,49 @@ const Sort = struct {
     direction: SortDirection,
 };
 
+/// `PaginationNulls`, the second key every `*Sort` input carries beside `order`.
+/// It decides where rows whose sort key is null land, which matters because so
+/// many sortable fields are routinely null (`dueDate`, `completedAt`, `cycle`,
+/// `milestone`, `slaStatus`, `delegate`, `release`, and every `customer*` field
+/// on a non-customer issue): `--sort dueDate:asc --limit 20` can otherwise spend
+/// the whole page on issues with no due date at all.
+const SortNulls = enum {
+    first,
+    last,
+
+    /// The `PaginationNulls` value this is sent as. Lowercase, unlike
+    /// `PaginationSortOrder` (`Ascending`/`Descending`) in the same object --
+    /// Linear rejects `First`. The tags are already the wire spelling, so this
+    /// is a plain `@tagName`; it exists to keep that casing contract named in
+    /// one place instead of inline at the emit site.
+    fn wireName(self: SortNulls) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// Accepted `--sort-nulls` values, comma-joined for the invalid-value
+/// diagnostic and the help text. Derived from `SortNulls` for the same reason
+/// `sort_field_list` is derived from `SortField`: the message cannot drift from
+/// what the parser accepts.
+const sort_nulls_list: []const u8 = blk: {
+    var out: []const u8 = "";
+    for (std.enums.values(SortNulls), 0..) |value, idx| {
+        const name: []const u8 = value.wireName();
+        out = if (idx == 0) name else out ++ ", " ++ name;
+    }
+    break :blk out;
+};
+
+/// The same list as a `first|last` alternation, for the usage signature.
+const sort_nulls_choices: []const u8 = blk: {
+    var out: []const u8 = "";
+    for (std.enums.values(SortNulls), 0..) |value, idx| {
+        const name: []const u8 = value.wireName();
+        out = if (idx == 0) name else out ++ "|" ++ name;
+    }
+    break :blk out;
+};
+
 const Options = struct {
     team: ?[]const u8 = null,
     state_type: ?[]const u8 = null,
@@ -122,6 +165,12 @@ const Options = struct {
     updated_since: ?[]const u8 = null,
     created_since: ?[]const u8 = null,
     sort: ?Sort = null,
+    /// Null placement for `sort`. Lives beside `sort` rather than inside it
+    /// because it arrives on its own flag: `--sort-nulls last --sort dueDate`
+    /// and `--sort dueDate --sort-nulls last` have to mean the same thing, and
+    /// a field inside `Sort` would be clobbered whenever `--sort` was parsed
+    /// second. `null` means the flag was absent, and nothing is sent.
+    sort_nulls: ?SortNulls = null,
     limit: usize = 25,
     max_items: ?usize = null,
     sub_limit: usize = 10,
@@ -166,6 +215,8 @@ pub fn run(ctx: Context) !u8 {
             error.InvalidPageCount => "invalid --pages value",
             error.InvalidLimit => "invalid --limit value",
             error.InvalidSort => "invalid --sort value",
+            error.InvalidSortNulls => "invalid --sort-nulls value",
+            error.SortNullsRequiresSort => "--sort-nulls requires --sort",
             else => @errorName(err),
         };
         try stderr.print("issues list: {s}\n", .{message});
@@ -173,6 +224,7 @@ pub fn run(ctx: Context) !u8 {
         // fields; with the whole `IssueSortInput` vocabulary it is not, so the
         // diagnostic spells the accepted values out.
         if (err == error.InvalidSort) try printSortVocabulary(stderr);
+        if (err == error.InvalidSortNulls) try printSortNullsVocabulary(stderr);
         try usage(stderr);
         return 1;
     };
@@ -636,6 +688,9 @@ pub fn run(ctx: Context) !u8 {
                 };
                 try sort_obj.object.put(var_alloc, "field", .{ .string = sort_field });
                 try sort_obj.object.put(var_alloc, "direction", .{ .string = sort_dir });
+                if (opts.sort_nulls) |nulls| {
+                    try sort_obj.object.put(var_alloc, "nulls", .{ .string = nulls.wireName() });
+                }
                 try root_obj.object.put(var_alloc, "sort", sort_obj);
             }
             try printer.printJson(root_obj, &out_writer.interface, true);
@@ -695,6 +750,9 @@ pub fn run(ctx: Context) !u8 {
             };
             try sort_obj.object.put(var_alloc, "field", .{ .string = sort_field });
             try sort_obj.object.put(var_alloc, "direction", .{ .string = sort_dir });
+            if (opts.sort_nulls) |nulls| {
+                try sort_obj.object.put(var_alloc, "nulls", .{ .string = nulls.wireName() });
+            }
             try root_obj.object.put(var_alloc, "sort", sort_obj);
         }
 
@@ -930,6 +988,12 @@ fn buildVariables(
 
         var sort_details = std.json.Value{ .object = std.json.ObjectMap.empty };
         try sort_details.object.put(allocator, "order", .{ .string = order_value });
+        // `nulls` sits beside `order` in the same `*Sort` object. Only written
+        // when `--sort-nulls` was given: absent means the server's own default
+        // placement, which is what every invocation predating the flag got.
+        if (opts.sort_nulls) |nulls| {
+            try sort_details.object.put(allocator, "nulls", .{ .string = nulls.wireName() });
+        }
 
         var sort_entry = std.json.Value{ .object = std.json.ObjectMap.empty };
         try sort_entry.object.put(allocator, field_name, sort_details);
@@ -1127,6 +1191,17 @@ pub fn parseOptions(args: []const []const u8) !Options {
             idx += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--sort-nulls")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.sort_nulls = try parseSortNulls(args[idx + 1]);
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--sort-nulls=")) {
+            opts.sort_nulls = try parseSortNulls(arg["--sort-nulls=".len..]);
+            idx += 1;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--limit")) {
             if (idx + 1 >= args.len) return error.MissingValue;
             opts.limit = try std.fmt.parseInt(usize, args[idx + 1], 10);
@@ -1239,6 +1314,9 @@ pub fn parseOptions(args: []const []const u8) !Options {
     }
     if (opts.limit == 0) return error.InvalidLimit;
     if (opts.all and opts.pages != null) return error.ConflictingPageFlags;
+    // `nulls` only exists inside a sort object, so there is nowhere to put it
+    // without `--sort`. Say so rather than accepting the flag and ignoring it.
+    if (opts.sort_nulls != null and opts.sort == null) return error.SortNullsRequiresSort;
     return opts;
 }
 
@@ -1250,9 +1328,17 @@ fn printSortVocabulary(writer: anytype) !void {
     );
 }
 
+fn printSortNullsVocabulary(writer: anytype) !void {
+    try writer.print("issues list: valid --sort-nulls values: {s}\n", .{sort_nulls_list});
+    try writer.print(
+        "issues list: --sort-nulls requires --sort; omit it to leave null placement to the server default\n",
+        .{},
+    );
+}
+
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear issues list [--team ID|KEY] [--state-type TYPES] [--state-id IDS] [--assignee USER_ID] [--label IDS] [--project ID] [--milestone ID] [--updated-since TS] [--created-since TS] [--sort FIELD[:asc|desc]] [--limit N] [--max-items N] [--sub-limit N] [--cursor CURSOR] [--pages N|--all] [--fields LIST] [--include-projects] [--plain] [--no-truncate] [--human-time] [--quiet] [--data-only] [--help]
+        \\Usage: linear issues list [--team ID|KEY] [--state-type TYPES] [--state-id IDS] [--assignee USER_ID] [--label IDS] [--project ID] [--milestone ID] [--updated-since TS] [--created-since TS] [--sort FIELD[:asc|desc]] [--sort-nulls {[nulls_choices]s}] [--limit N] [--max-items N] [--sub-limit N] [--cursor CURSOR] [--pages N|--all] [--fields LIST] [--include-projects] [--plain] [--no-truncate] [--human-time] [--quiet] [--data-only] [--help]
         \\Flags:
         \\  --team ID|KEY         Team id or key (default: config.default_team_id)
         \\  --state-type VALUES   Comma-separated state types: triage,backlog,unstarted,started,completed,canceled
@@ -1266,8 +1352,11 @@ pub fn usage(writer: anytype) !void {
         \\  --updated-since TS    Only include issues updated after the timestamp
         \\  --created-since TS    Only include issues created after the timestamp
         \\  --sort FIELD[:DIR]    Sort by an IssueSortInput field (dir asc|desc, default: desc)
-        \\                        Fields: {s}
+        \\                        Fields: {[fields]s}
         \\                        Aliases: created -> createdAt, updated -> updatedAt
+        \\  --sort-nulls WHERE    Where issues with no value for the --sort field go: {[nulls_list]s}
+        \\                        Requires --sort. Omitted, null placement is left to the
+        \\                        server default (nothing is sent)
         \\  --limit N             Page size per request (default: 25)
         \\  --max-items N         Stop after emitting N issues (may truncate within a page)
         \\  --sub-limit N         Sub-issues to fetch per parent; also opts into fetching them
@@ -1286,9 +1375,14 @@ pub fn usage(writer: anytype) !void {
         \\Examples:
         \\  linear issues list --team ENG --pages 2 --limit 50 --sort updated:desc
         \\  linear issues list --team ENG --sort priority:asc --state-type started
+        \\  linear issues list --team ENG --sort dueDate:asc --sort-nulls last --limit 20
         \\  linear issues list --state-type todo,in_progress --label lbl-1,lbl-2 --assignee user-123
         \\
-    , .{sort_field_help});
+    , .{
+        .fields = sort_field_help,
+        .nulls_choices = sort_nulls_choices,
+        .nulls_list = sort_nulls_list,
+    });
 }
 
 fn parseSort(raw: []const u8) !Sort {
@@ -1317,6 +1411,18 @@ fn parseSort(raw: []const u8) !Sort {
         .field = field,
         .direction = direction,
     };
+}
+
+/// Resolves a user-supplied `--sort-nulls` value. Matched case-insensitively
+/// like every other enum-valued flag; the resolved value is always emitted in
+/// the schema's lowercase spelling.
+fn parseSortNulls(raw: []const u8) !SortNulls {
+    const value = std.mem.trim(u8, raw, " \t");
+    if (value.len == 0) return error.InvalidSortNulls;
+    for (std.enums.values(SortNulls)) |candidate| {
+        if (std.ascii.eqlIgnoreCase(value, candidate.wireName())) return candidate;
+    }
+    return error.InvalidSortNulls;
 }
 
 /// Resolves a user-supplied `--sort` field name. The vocabulary is the schema's
