@@ -219,6 +219,54 @@ fn printRateLimit(io: std.Io, prefix: []const u8, info: graphql.GraphqlClient.Ra
     try stderr.print("\n", .{});
 }
 
+/// Result of a cursor walk, as every paginating list command reports it.
+///
+/// The walk itself stays per-entity — each command has its own connection
+/// field, node projection and output modes — but the closing report is pure
+/// formatting with no entity in it, so it lives here instead of being retyped
+/// six times and drifting.
+pub const PageProgress = struct {
+    /// Items actually emitted, which is not the number fetched when
+    /// `--max-items` truncated the final page.
+    items: usize = 0,
+    pages: usize = 0,
+    more_available: bool = false,
+    end_cursor: ?[]const u8 = null,
+    max_items_reached: bool = false,
+};
+
+/// Prints the fetched-count summary and, when the walk stopped early, the
+/// `--max-items` notice.
+///
+/// The summary is suppressed under `--json` so it never has to be filtered out
+/// of a machine-readable run; the `--max-items` notice is not, because it
+/// reports a deliberately truncated result set.
+pub fn printPageSummary(
+    stderr: anytype,
+    prefix: []const u8,
+    progress: PageProgress,
+    json_output: bool,
+) !void {
+    if (!json_output) {
+        const plural: []const u8 = if (progress.pages == 1) "" else "s";
+        if (progress.more_available) {
+            const cursor_value = progress.end_cursor orelse "(unknown)";
+            try stderr.print(
+                "{s}: fetched {d} items across {d} page{s}; more available, resume with --cursor {s}\n",
+                .{ prefix, progress.items, progress.pages, plural, cursor_value },
+            );
+        } else {
+            try stderr.print(
+                "{s}: fetched {d} items across {d} page{s}\n",
+                .{ prefix, progress.items, progress.pages, plural },
+            );
+        }
+    }
+    if (progress.max_items_reached) {
+        try stderr.print("{s}: stopped after {d} items due to --max-items\n", .{ prefix, progress.items });
+    }
+}
+
 pub const ResolvedId = struct {
     value: []const u8,
     owned: bool = false,

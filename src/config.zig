@@ -568,7 +568,12 @@ fn resolvePath(allocator: Allocator, environ: std.process.Environ, override_path
     return std.fs.path.join(allocator, &.{ home, ".config", "linear", "config.json" });
 }
 
-fn validateCredentialHelper(argv: []const []const u8) CredentialHelperError!void {
+/// Checks argv against the bounds above without storing it.
+///
+/// `setCredentialHelper` runs this itself; it is public so a caller that wants
+/// to reject a bad helper *before* spawning it can use the same rules rather
+/// than growing a second set that drifts.
+pub fn validateCredentialHelper(argv: []const []const u8) CredentialHelperError!void {
     if (argv.len == 0) return CredentialHelperError.EmptyCredentialHelper;
     if (argv.len > max_credential_helper_args) return CredentialHelperError.TooManyCredentialHelperArgs;
     for (argv) |entry| {

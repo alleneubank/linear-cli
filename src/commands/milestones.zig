@@ -31,8 +31,15 @@ pub const Context = struct {
 const Mode = enum { list, view, create, update, delete };
 
 pub const ListOptions = struct {
+    /// Absent means the whole workspace; the root `projectMilestones` query is
+    /// used either way and `--project` only adds a filter.
     project: ?[]const u8 = null,
+    /// Page size per request, not a total; `--max-items` caps the total.
     limit: usize = 50,
+    max_items: ?usize = null,
+    cursor: ?[]const u8 = null,
+    pages: ?usize = null,
+    all: bool = false,
     fields: ?[]const u8 = null,
     plain: bool = false,
     no_truncate: bool = false,
@@ -150,6 +157,7 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
     const opts = parseListOptions(args) catch |err| {
         const message = switch (err) {
             error.InvalidLimit => "invalid --limit value",
+            error.InvalidPageCount => "invalid --pages value",
             else => @errorName(err),
         };
         try stderr.print("milestone list: {s}\n", .{message});
@@ -163,11 +171,6 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
         try listUsage(&out_writer.interface);
         return 0;
     }
-
-    const project_ref = opts.project orelse {
-        try stderr.print("milestone list: --project is required\n", .{});
-        return 1;
-    };
 
     var field_buf = std.ArrayListUnmanaged(printer.MilestoneField).empty;
     defer field_buf.deinit(ctx.allocator);
@@ -184,6 +187,12 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
         try stderr.print("milestone list: --limit must be greater than zero\n", .{});
         return 1;
     }
+    if (opts.max_items) |max_value| {
+        if (max_value == 0) {
+            try stderr.print("milestone list: invalid --max-items value\n", .{});
+            return 1;
+        }
+    }
 
     const api_key = common.requireApiKey(ctx.config, null, stderr, "milestone list") catch {
         return 1;
@@ -195,10 +204,17 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
     client.timeout_ms = ctx.timeout_ms;
     if (ctx.endpoint) |ep| client.endpoint = ep;
 
-    const project = resolveProject(ctx.allocator, &client, project_ref, stderr, "milestone list") catch {
-        return 1;
+    // `--project` narrows the same root query rather than selecting a different
+    // one, so scoped and workspace-wide listings share one code path.
+    var project: ?common.ResolvedId = null;
+    defer if (project) |resolved| {
+        if (resolved.owned) ctx.allocator.free(resolved.value);
     };
-    defer if (project.owned) ctx.allocator.free(project.value);
+    if (opts.project) |project_ref| {
+        project = resolveProject(ctx.allocator, &client, project_ref, stderr, "milestone list") catch {
+            return 1;
+        };
+    }
 
     const disable_trunc = opts.plain or opts.no_truncate;
     const table_opts = printer.TableOptions{
@@ -210,99 +226,184 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    const limit_i64 = std.math.cast(i64, opts.limit) orelse return error.InvalidLimit;
-    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
-    try variables.object.put(var_alloc, "id", .{ .string = project.value });
-    try variables.object.put(var_alloc, "first", .{ .integer = limit_i64 });
+    const page_size = opts.limit;
+    const limit_i64 = std.math.cast(i64, page_size) orelse return error.InvalidLimit;
+
+    // Built once and reused by every page; only `after` changes between requests.
+    var project_filter: ?std.json.Value = null;
+    if (project) |resolved| {
+        var eq_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try eq_obj.object.put(var_alloc, "eq", .{ .string = resolved.value });
+
+        var id_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try id_obj.object.put(var_alloc, "id", eq_obj);
+
+        var filter = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try filter.object.put(var_alloc, "project", id_obj);
+        project_filter = filter;
+    }
 
     const query =
-        \\query ProjectMilestones($id: String!, $first: Int!) {
-        \\  project(id: $id) {
-        \\    id
-        \\    name
-        \\    projectMilestones(first: $first) {
-        \\      nodes { id name description targetDate sortOrder }
-        \\      pageInfo { hasNextPage endCursor }
-        \\    }
+        \\query ProjectMilestones($first: Int!, $after: String, $filter: ProjectMilestoneFilter) {
+        \\  projectMilestones(first: $first, after: $after, filter: $filter) {
+        \\    nodes { id name description targetDate sortOrder project { id name } }
+        \\    pageInfo { hasNextPage endCursor }
         \\  }
         \\}
     ;
-
-    var response = common.send(ctx.allocator, "milestone list", &client, .{
-        .query = query,
-        .variables = variables,
-        .operation_name = "ProjectMilestones",
-    }, stderr) catch {
-        return 1;
-    };
-    defer response.deinit();
-
-    common.checkResponse(ctx.io, "milestone list", &response, stderr, api_key) catch {
-        return 1;
-    };
-
-    const data_value = response.data() orelse {
-        try stderr.print("milestone list: response missing data\n", .{});
-        return 1;
-    };
-    const project_obj = common.getObjectField(data_value, "project") orelse {
-        try stderr.print("milestone list: project not found in response\n", .{});
-        return 1;
-    };
-    const project_name = common.getStringField(project_obj, "name") orelse "";
 
     const want_table = !ctx.json_output and !opts.data_only and !opts.quiet;
     const want_data_rows = opts.data_only or opts.quiet;
     const want_raw_nodes = ctx.json_output and !opts.data_only and !opts.quiet;
 
-    if (want_raw_nodes) {
-        var out_buf: [0]u8 = undefined;
-        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
-        try printer.printJson(data_value, &out_writer.interface, true);
-        return 0;
+    // Row fields are slices borrowed from each page's parsed body, so no page
+    // may be freed until every row has been printed; the whole `Response` is
+    // kept and released together at the end.
+    var responses = std.ArrayListUnmanaged(graphql.GraphqlClient.Response).empty;
+    defer {
+        for (responses.items) |*resp| resp.deinit();
+        responses.deinit(ctx.allocator);
     }
-
-    const milestones_obj = common.getObjectField(project_obj, "projectMilestones") orelse {
-        try stderr.print("milestone list: projectMilestones not found in response\n", .{});
-        return 1;
-    };
-    const nodes_array = common.getArrayField(milestones_obj, "nodes") orelse {
-        try stderr.print("milestone list: nodes missing in response\n", .{});
-        return 1;
-    };
-    const page_info = common.getObjectField(milestones_obj, "pageInfo");
-    const has_next = if (page_info) |pi| common.getBoolField(pi, "hasNextPage") orelse false else false;
-    const end_cursor = if (page_info) |pi| common.getStringField(pi, "endCursor") else null;
 
     var rows = std.ArrayListUnmanaged(printer.MilestoneRow).empty;
     defer rows.deinit(ctx.allocator);
     var data_rows = std.ArrayListUnmanaged(MilestoneData).empty;
     defer data_rows.deinit(ctx.allocator);
+    var nodes_accumulator = std.ArrayListUnmanaged(std.json.Value).empty;
+    defer nodes_accumulator.deinit(ctx.allocator);
 
-    for (nodes_array.items) |node| {
-        if (node != .object) continue;
-        const id = common.getStringField(node, "id") orelse continue;
-        const row = MilestoneData{
-            .id = id,
-            .name = common.getStringField(node, "name") orelse "",
-            .target_date = common.getStringField(node, "targetDate") orelse "",
-            .sort_order = try formatNumber(var_alloc, node, "sortOrder"),
-            .description = common.getStringField(node, "description") orelse "",
-            .project = project_name,
+    var progress = common.PageProgress{};
+    var next_cursor = opts.cursor;
+    const page_limit: ?usize = if (opts.all) null else opts.pages orelse 1;
+
+    while (true) {
+        if (page_limit) |limit_pages| {
+            if (progress.pages >= limit_pages) break;
+        }
+
+        var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try variables.object.put(var_alloc, "first", .{ .integer = limit_i64 });
+        if (next_cursor) |cursor_value| try variables.object.put(var_alloc, "after", .{ .string = cursor_value });
+        if (project_filter) |filter| try variables.object.put(var_alloc, "filter", filter);
+
+        var response = common.send(ctx.allocator, "milestone list", &client, .{
+            .query = query,
+            .variables = variables,
+            .operation_name = "ProjectMilestones",
+        }, stderr) catch {
+            return 1;
+        };
+        var response_owned = true;
+        errdefer if (response_owned) response.deinit();
+
+        // `errdefer` does not fire on `return 1` — that is a successful return
+        // of an exit code — so a rejected page is freed by hand here.
+        common.checkResponse(ctx.io, "milestone list", &response, stderr, api_key) catch {
+            if (response_owned) response.deinit();
+            return 1;
         };
 
-        if (want_table) {
-            try rows.append(ctx.allocator, .{
-                .id = row.id,
-                .name = row.name,
-                .target_date = row.target_date,
-                .sort_order = row.sort_order,
-                .description = row.description,
-                .project = row.project,
-            });
+        try responses.append(ctx.allocator, response);
+        response_owned = false;
+        const resp = &responses.items[responses.items.len - 1];
+
+        const data_value = resp.data() orelse {
+            try stderr.print("milestone list: response missing data\n", .{});
+            return 1;
+        };
+        const milestones_obj = common.getObjectField(data_value, "projectMilestones") orelse {
+            try stderr.print("milestone list: projectMilestones not found in response\n", .{});
+            return 1;
+        };
+        const nodes_array = common.getArrayField(milestones_obj, "nodes") orelse {
+            try stderr.print("milestone list: nodes missing in response\n", .{});
+            return 1;
+        };
+
+        if (opts.max_items) |max_value| {
+            if (progress.items >= max_value) {
+                progress.max_items_reached = true;
+                break;
+            }
         }
-        if (want_data_rows) try data_rows.append(ctx.allocator, row);
+
+        const take_count = @min(nodes_array.items.len, page_size);
+        const remaining_allowed = if (opts.max_items) |max_value| max_value - progress.items else take_count;
+        const allowed_count = @min(take_count, remaining_allowed);
+        const page_nodes = nodes_array.items[0..allowed_count];
+
+        progress.items += allowed_count;
+        if (opts.max_items) |max_value| {
+            if (progress.items >= max_value) progress.max_items_reached = true;
+        }
+        progress.pages += 1;
+
+        if (want_raw_nodes) {
+            for (page_nodes) |node| try nodes_accumulator.append(ctx.allocator, node);
+        }
+
+        if (want_table or want_data_rows) {
+            for (page_nodes) |node| {
+                if (node != .object) continue;
+                const id = common.getStringField(node, "id") orelse continue;
+                // The project name comes off the node, not off an enclosing
+                // project, so a workspace-wide listing stays disambiguated.
+                const node_project = common.getObjectField(node, "project");
+                const row = MilestoneData{
+                    .id = id,
+                    .name = common.getStringField(node, "name") orelse "",
+                    .target_date = common.getStringField(node, "targetDate") orelse "",
+                    .sort_order = try formatNumber(var_alloc, node, "sortOrder"),
+                    .description = common.getStringField(node, "description") orelse "",
+                    .project = if (node_project) |p| common.getStringField(p, "name") orelse "" else "",
+                };
+
+                if (want_table) {
+                    try rows.append(ctx.allocator, .{
+                        .id = row.id,
+                        .name = row.name,
+                        .target_date = row.target_date,
+                        .sort_order = row.sort_order,
+                        .description = row.description,
+                        .project = row.project,
+                    });
+                }
+                if (want_data_rows) try data_rows.append(ctx.allocator, row);
+            }
+        }
+
+        const page_info = common.getObjectField(milestones_obj, "pageInfo");
+        const has_next = if (page_info) |pi| common.getBoolField(pi, "hasNextPage") orelse false else false;
+        progress.end_cursor = if (page_info) |pi| common.getStringField(pi, "endCursor") else null;
+        progress.more_available = has_next;
+
+        if (allowed_count < take_count and opts.max_items != null) {
+            progress.max_items_reached = true;
+        }
+
+        if (take_count == 0 or allowed_count == 0) {
+            if (has_next) {
+                try stderr.print("milestone list: received empty page; stopping pagination\n", .{});
+            }
+            break;
+        }
+
+        if (!has_next) break;
+        if (page_limit) |limit_pages| {
+            if (progress.pages >= limit_pages) break;
+        }
+        if (progress.max_items_reached) {
+            progress.more_available = true;
+            break;
+        }
+        if (progress.end_cursor == null) {
+            try stderr.print("milestone list: missing endCursor for additional page\n", .{});
+            break;
+        }
+        next_cursor = progress.end_cursor;
     }
+
+    if (progress.max_items_reached) progress.more_available = true;
 
     var out_buf: [0]u8 = undefined;
     var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
@@ -325,13 +426,7 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
             }
             var root_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
             try root_obj.object.put(var_alloc, "nodes", .{ .array = out_array });
-
-            var page_info_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
-            try page_info_obj.object.put(var_alloc, "hasNextPage", .{ .bool = has_next });
-            if (end_cursor) |cursor_value| {
-                try page_info_obj.object.put(var_alloc, "endCursor", .{ .string = cursor_value });
-            }
-            try root_obj.object.put(var_alloc, "pageInfo", page_info_obj);
+            try root_obj.object.put(var_alloc, "pageInfo", try pageInfoValue(var_alloc, progress));
             try root_obj.object.put(var_alloc, "limit", .{ .integer = limit_i64 });
             try printer.printJson(root_obj, stdout_iface, true);
         } else {
@@ -344,16 +439,34 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
                 try stdout_iface.writeByte('\n');
             }
         }
+    } else if (want_raw_nodes) {
+        var nodes_value = std.json.Value{ .array = std.json.Array.init(var_alloc) };
+        try nodes_value.array.appendSlice(nodes_accumulator.items);
+
+        var milestones_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try milestones_obj.object.put(var_alloc, "nodes", nodes_value);
+        try milestones_obj.object.put(var_alloc, "pageInfo", try pageInfoValue(var_alloc, progress));
+
+        var root_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try root_obj.object.put(var_alloc, "projectMilestones", milestones_obj);
+        try printer.printJson(root_obj, stdout_iface, true);
     } else {
         try printer.printMilestoneTable(ctx.allocator, stdout_iface, rows.items, selected_fields, table_opts);
     }
 
-    if (has_next and !ctx.json_output) {
-        const cursor_value = end_cursor orelse "(unknown)";
-        try stderr.print("milestone list: more milestones available; pagination not implemented (endCursor {s})\n", .{cursor_value});
-    }
-
+    try common.printPageSummary(stderr, "milestone list", progress, ctx.json_output);
     return 0;
+}
+
+/// Renders the walk's final cursor state in the same `pageInfo` shape the API
+/// uses, so a `--json` consumer can resume with `--cursor` unchanged.
+fn pageInfoValue(allocator: Allocator, progress: common.PageProgress) !std.json.Value {
+    var page_info = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try page_info.object.put(allocator, "hasNextPage", .{ .bool = progress.more_available });
+    if (progress.end_cursor) |cursor_value| {
+        try page_info.object.put(allocator, "endCursor", .{ .string = cursor_value });
+    }
+    return page_info;
 }
 
 // ---------------------------------------------------------------------------
@@ -1316,6 +1429,48 @@ pub fn parseListOptions(args: []const []const u8) !ListOptions {
             idx += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--max-items")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.max_items = try std.fmt.parseInt(usize, args[idx + 1], 10);
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--max-items=")) {
+            opts.max_items = try std.fmt.parseInt(usize, arg["--max-items=".len..], 10);
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--cursor")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.cursor = args[idx + 1];
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--cursor=")) {
+            opts.cursor = arg["--cursor=".len..];
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pages")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            const value = try std.fmt.parseInt(usize, args[idx + 1], 10);
+            if (value == 0) return error.InvalidPageCount;
+            opts.pages = value;
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--pages=")) {
+            const value = try std.fmt.parseInt(usize, arg["--pages=".len..], 10);
+            if (value == 0) return error.InvalidPageCount;
+            opts.pages = value;
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--all")) {
+            opts.all = true;
+            idx += 1;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--fields")) {
             if (idx + 1 >= args.len) return error.MissingValue;
             opts.fields = args[idx + 1];
@@ -1350,6 +1505,7 @@ pub fn parseListOptions(args: []const []const u8) !ListOptions {
         if (arg.len > 0 and arg[0] == '-') return error.UnknownFlag;
         return error.UnexpectedArgument;
     }
+    if (opts.all and opts.pages != null) return error.ConflictingPageFlags;
     return opts;
 }
 
@@ -1637,10 +1793,15 @@ pub fn usage(writer: anytype) !void {
 
 pub fn listUsage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear milestone list --project ID|NAME [--limit N] [--fields LIST] [--plain] [--no-truncate] [--quiet] [--data-only] [--help]
+        \\Usage: linear milestone list [--project ID|NAME] [--limit N] [--max-items N] [--cursor CURSOR] [--pages N|--all] [--fields LIST] [--plain] [--no-truncate] [--quiet] [--data-only] [--help]
         \\Flags:
-        \\  --project ID|NAME  Project id, slug, or exact name (required)
-        \\  --limit N          Number of milestones to fetch (default: 50)
+        \\  --project ID|NAME  Project id, slug, or exact name (omitted: every project's
+        \\                     milestones, disambiguated by the Project column)
+        \\  --limit N          Page size per request (default: 50)
+        \\  --max-items N      Stop after emitting N milestones (may truncate within a page)
+        \\  --cursor CURSOR    Start pagination after the provided cursor
+        \\  --pages N          Fetch up to N pages (default: 1)
+        \\  --all              Fetch all pages until the end
         \\  --fields LIST      Comma-separated columns (id,name,target_date,sort_order,description,project)
         \\  --plain            Do not pad or truncate table cells
         \\  --no-truncate      Disable ellipsis and padding in table cells
@@ -1649,6 +1810,7 @@ pub fn listUsage(writer: anytype) !void {
         \\  --help             Show this help message
         \\Examples:
         \\  linear milestone list --project "Roadmap"
+        \\  linear milestone list --all --fields id,name,project --data-only
         \\  linear issues list --team ENG --milestone "$(linear milestone list --project Roadmap --quiet | head -1)"
         \\
     , .{});

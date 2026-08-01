@@ -72,10 +72,10 @@ when you actually want the files.
 | `--data-only` | same commands as `--quiet`, plus `gql` | off | Tab-separated rows; with `--json`, bare JSON instead of the wrapped envelope |
 | `--plain` | `issues list`, `issue comment list`, `projects list`, `teams list`, `labels list`, `users list`, `states list`, `milestone list` | off | No cell padding or truncation |
 | `--no-truncate` | same commands as `--plain` | off | Same effect as `--plain` in this CLI |
-| `--limit N` | `issues list` (25), `projects list` (50), `search` (25), `issue comment list` (50), `labels list` (50), `users list` (50), `states list` (50), `milestone list` (50) | see left | Page size / max results |
-| `--max-items N` | `issues list` | unset | Hard stop after N issues across all pages |
-| `--pages N` | `issues list` | 1 | Fetch up to N pages |
-| `--cursor CURSOR` | `issues list` | unset | Resume pagination after a cursor |
+| `--limit N` | `issues list` (25), `projects list` (50), `search` (25), `issue comment list` (50), `labels list` (50), `users list` (50), `states list` (50), `milestone list` (50) | see left | Page size **per request** (max results for `search`/`issue comment list`, which do not paginate) |
+| `--max-items N` | `issues list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | unset | Hard stop after N items across all pages (may truncate mid-page) |
+| `--pages N` | `issues list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | 1 | Fetch up to N pages |
+| `--cursor CURSOR` | `issues list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | unset | Resume pagination after a cursor |
 | `--sub-limit N` | `issues list`, `issue view` | 10 | Sub-issues per parent; **`0` disables the sub-query** |
 | `--comment-limit N` | `issue view` | 10 | Comments to fetch; `0` disables |
 | `--issue-limit N` | `project view` | 10 | Issues to fetch; `0` disables |
@@ -86,7 +86,7 @@ Flags that **add** output — only pass them when you need the extra data:
 | Flag | Available on | Effect |
 |------|--------------|--------|
 | `--include-projects` | `issues list` | Adds `project` and `milestone` columns and their sub-queries |
-| `--all` | `issues list` | Fetches every page until exhausted (conflicts with `--pages`) |
+| `--all` | `issues list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | Fetches every page until exhausted (conflicts with `--pages`) |
 | `--attachment-dir DIR` | `issue view` | Downloads `uploads.linear.app` files from the description into DIR (created 0600). Off unless the flag is passed; `--attachment-dir ""` is the same as omitting it |
 
 ### You need X → use Y, not Z
@@ -121,6 +121,8 @@ Flags that **add** output — only pass them when you need the extra data:
 - `users list --fields`: `id`, `name`, `display_name`, `email`, `active`. Default: `id,name,display_name,email`.
 - `states list --fields`: `id`, `name`, `type`, `position`, `team`. Default: all five.
 - `milestone list --fields`: `id`, `name`, `target_date`, `sort_order`, `description`, `project`.
+  Default: `id,name,target_date,sort_order,project`. `project` is a default because an unfiltered
+  listing spans projects and milestone names repeat; drop it with `--fields` if you do not want it.
   Default: `id,name,target_date,sort_order`.
 - `issue comment list --fields`: `id`, `author`, `body`, `created_at`, `updated_at`, `parent`, `url`.
   Default: `id,author,created_at,body`.
@@ -173,14 +175,21 @@ hard-deleting it. `--dry-run` resolves and validates the target, prints it, and 
 **Wrong:** assuming the issue is unrecoverable, or skipping straight to `--yes`.
 **Right:** `linear issue delete ENG-123 --dry-run`, then `linear issue delete ENG-123 --yes`.
 
-`--reason TEXT` is **local only**. The mutation sends `$id` and nothing else, so the reason is never
-recorded in Linear — it is echoed back into this command's own stdout (and into the `reason` key under
-`--json`/`--data-only`) for the caller's audit log. An empty or whitespace-only value is rejected
-(`issue delete: invalid --reason value`).
+There is **no `--reason`**. Linear's `issueDelete` accepts `(id, permanentlyDelete)` and nothing else, so
+a reason has nowhere to go — the flag used to be parsed and echoed back into this command's own output,
+which read exactly like an audit trail that existed in Linear's trash or activity feed. It was removed
+rather than deprecated, so it now fails during flag parsing:
 
-**Wrong:** `linear issue delete ENG-123 --reason "duplicate" --yes` expecting the reason to show up in
-Linear's trash or activity feed.
-**Right:** capture it yourself — `linear issue delete ENG-123 --reason "duplicate" --yes --json >> audit.jsonl`.
+```
+issue delete: UnknownFlag
+```
+
+**Wrong:** `linear issue delete ENG-123 --reason "duplicate" --yes` — the flag is rejected, and it never
+recorded anything in Linear when it was accepted.
+**Right:** record the reason on your side —
+`echo "ENG-123 duplicate" >> audit.log && linear issue delete ENG-123 --yes --json >> audit.jsonl`,
+or leave it as a comment on the issue with `linear issue comment ENG-123 --body "duplicate" --yes`
+before deleting, which *is* stored in Linear.
 
 ### Mutations without `--yes` fail on stderr — which piped stdout hides
 
@@ -214,22 +223,32 @@ same command with `--yes`. Queries are unaffected — never add `--yes` to a rea
 
 ### Never print the API key — `auth status` answers the question instead
 
-`linear auth status` reports **which backend supplied the key and whether it is usable**, and the key
+`linear auth status` reports **which backend supplied the key and whether it is well-formed**, and the key
 reaches no stream at all — not stdout, not stderr, not the `--json` document, not even as a redacted
 fingerprint. It is the diagnostic to reach for, and the one that is safe to paste into a bug report:
 
 ```
 source           : credential_helper
-key              : present (valid)
+key              : present (format-valid, unverified)
+verify           : run 'linear auth test' to check the key against the API
 credential_helper: op read op://Private/Linear/api-key
 keychain         : /usr/bin/security
 file_api_key     : absent
 config_path      : /Users/you/.config/linear/config.json
 ```
 
-It exits **0 only when a usable key was found**, `1` otherwise, so it doubles as a precondition check.
-`--json` reports the same facts as `source`, `key_present`, `key_valid`, `credential_helper`,
-`keychain_supported`, `file_key_present`, `config_path` — and no `api_key` field exists in that object.
+`format-valid` means **only** that the key matches the expected charset and length (4-512 characters from
+`[A-Za-z0-9_-]`). `auth status` never touches the network, so a revoked key, a key for the wrong
+workspace, or a fixture string like `test-key` all report `format-valid` and still fail on first use.
+`linear auth test` is the only command that round-trips the credential against the API. A key that fails
+even the charset check reports `present (malformed)`.
+
+It exits **0 only when a well-formed key was found**, `1` otherwise, so it doubles as a *precondition*
+check — not a proof that the key works.
+`--json` reports the same facts as `source`, `key_present`, `key_format_valid`, `key_verified` (always
+`null`, because status never verifies), `credential_helper`, `keychain_supported`, `file_key_present`,
+`config_path` — and no `api_key` field exists in that object. (The old `key_valid` key was renamed to
+`key_format_valid`; it always meant the format check.)
 
 `linear auth show` is redacted (`lin_...abcd` — first four and last four characters) by default, including
 with `--json`; a key shorter than 16 characters prints as `<redacted>`. `--reveal` prints the
@@ -275,12 +294,26 @@ Trailing whitespace and the newline every secret manager emits are trimmed. The 
 never logged, printed, or quoted in a diagnostic** — that is where the secret is; only its exit status and
 the first line of its stderr (200 bytes, control bytes stripped) appear.
 
-`config set credential_helper` is refused on purpose — a stored-but-broken helper locks you out, so only
-`auth migrate --to helper`, which verifies a read-back first, writes it:
+Set it from the CLI with `config set`, which takes the same whitespace-split bare string:
+
+```bash
+linear config set credential_helper "op read op://Private/Linear/api-key"
+```
+
+This is the **bootstrap path that never puts the key on disk**: put the key in your secret manager, point
+a helper at it, done. The helper is **run once before it is stored** and has to hand back a usable key.
+One that fails to spawn, exits non-zero, prints nothing, or prints something that is not a key is refused
+and nothing is written — a stored-but-broken helper *clears* the effective key instead of falling through
+(see below), so saving one would lock you out. The argv bounds above are checked before anything is
+spawned. Nothing the helper writes to stdout is ever printed.
 
 ```
-config set: credential_helper is set by 'linear auth migrate --to helper <command>', which verifies the helper before storing it
+config set: credential_helper 'op read op://Private/Linear/api-key' exited 1: vault is locked
+config set: credential_helper was not saved
 ```
+
+`auth migrate --to helper` is for the *other* situation: a plaintext key already on disk that needs
+moving. It verifies the helper hands back that exact key before scrubbing the plaintext copy.
 
 ### A failing `credential_helper` clears the key — it does not fall through
 
@@ -309,23 +342,24 @@ the cheapest form and the one to substitute into another command.
 | `--assignee` (someone other than `me`) | `issues list`, `search`, `issue create`, `issue update` | `linear users list --limit 50 --quiet` |
 | `--label` / `--labels` | `issues list` (`--label`), `issue create` (`--labels`) | `linear labels list --team KEY --limit 50 --quiet` |
 | `--state-id` | `issues list` | `linear states list --team KEY --limit 50 --quiet` |
-| `--milestone` | `issues list` | `linear milestone list --project ID\|NAME --limit 50 --quiet` |
+| `--milestone` | `issues list` | `linear milestone list [--project ID\|NAME] --limit 50 --quiet` |
 
 ```bash
 linear labels list --team ENG --limit 50 --fields id,name --data-only
 linear users list --limit 50 --fields id,email --data-only
 linear states list --team ENG --limit 50 --fields id,name,type --data-only
 linear milestone list --project "Roadmap" --limit 50 --fields id,name --data-only
+linear milestone list --limit 50 --fields id,name,project --data-only   # every project
 ```
 
 **Wrong:** `linear gql --data-only 'query { issueLabels(first: 100) { nodes { id name } } }'` — a raw
 query where a projection-capable command exists.
 **Right:** `linear labels list --team ENG --limit 50 --fields id,name --data-only`.
 
-One remaining gap where `gql` is still the answer:
-
-- `milestone list` **requires** `--project`; there is no cross-project listing. Use the
-  `projectMilestones` query for that.
+There is no remaining enumeration gap: `milestone list` with no `--project` lists every project's
+milestones (the `Project` column disambiguates them), and all five enumeration commands walk cursors
+with `--pages N` / `--all` / `--cursor` / `--max-items`, so neither a cross-project listing nor a
+long one needs `gql`.
 
 `--assignee me` is resolved by the CLI on `issues list`, `search`, and `issue update` — prefer it.
 `--project` and `--team` also need no lookup: `linear projects list --fields id,name` and
@@ -472,17 +506,19 @@ linear help project create
   platform) and the key is never written to disk:
 
   ```bash
-  # 1. Put the key in the manager. 2. Land it in the config file. 3. Migrate.
-  op read "op://<vault>/<item>/<field>" | linear auth set
-  linear auth migrate --to helper op read "op://<vault>/<item>/<field>"
+  # 1. Put the key in the manager. 2. Point a helper at it. Nothing touches disk.
+  linear config set credential_helper "op read op://<vault>/<item>/<field>"
   linear auth status        # source: credential_helper
+  linear auth test          # and it actually works
   ```
 
-  `migrate` pushes the key nowhere — it runs the helper, compares what the helper prints with the key in
-  the config file, and only then removes the plaintext copy. That is why the `auth set` step exists:
-  `migrate` has nothing to move without an on-disk key, and `config set credential_helper` is refused.
-  Because the key was briefly on disk, **rotate it afterwards**. See
+  `config set` runs the helper before storing it and refuses to save one that does not return a usable
+  key, so a broken helper can never be persisted. See
   [Traps](#credential_helper-is-an-argv-array-not-a-shell-command-line) for the argv rule and the bounds.
+
+  Use `auth migrate --to helper` only when a plaintext key is **already** in the config file and needs
+  moving out. It pushes the key nowhere — it runs the helper, compares what the helper prints with the key
+  on disk, and only then scrubs the plaintext copy. Because that key was on disk, **rotate it afterwards**.
 - **macOS with no secret manager:** `linear auth migrate --to keychain` (item `linear-cli`/`api-key`, read
   via `/usr/bin/security`; same `auth set` bootstrap). This buys **encryption at rest** and immunity to
   accidental disclosure — backups, synced folders, a stray `cat` of the config. It is **not** process
@@ -499,6 +535,9 @@ linear help project create
 - Keys must be 4-512 characters from `[A-Za-z0-9_-]`; anything else is rejected at every ingestion point
   (config file, `LINEAR_CONFIG`, `LINEAR_API_KEY`, `auth set`, and every credential backend)
 - Defaults: `linear config set default_team_id TEAM_KEY`, `linear config set default_output json|table`, `linear config set default_state_filter completed,canceled`
+- `default_team_id` is verified against the workspace before it is written: an unknown team is refused
+  (nothing saved), and a lookup that could not complete is reported as `could not verify team` rather than
+  as a missing one. There is no `--force`
 - Inspect or reset defaults: `linear config show`, `linear config unset default_output`
 - Config path: `~/.config/linear/config.json` (override with `--config PATH` or `LINEAR_CONFIG`)
 
@@ -619,10 +658,19 @@ linear teams list --fields id,key,name
 linear labels list --team TEAM_KEY --limit 50 --fields id,name --data-only
 linear users list --limit 50 --fields id,name,email --data-only
 linear states list --team TEAM_KEY --limit 50 --fields id,name,type --data-only
+
+# Milestones for one project, or workspace-wide when --project is omitted
 linear milestone list --project "Roadmap" --limit 50 --fields id,name --data-only
+linear milestone list --all --fields id,name,project --data-only
 
 # Bare ids only — the cheapest form, one per line
 linear labels list --team TEAM_KEY --limit 50 --quiet
+
+# Past the first page: --all walks to the end, --pages N takes N pages,
+# --cursor resumes from the value stderr printed, --max-items caps the total
+linear users list --all --quiet
+linear states list --pages 3 --limit 50 --fields id,name,team --data-only
+linear labels list --team TEAM_KEY --all --max-items 200 --quiet
 
 # Substitute straight into a filter
 linear issues list --team TEAM_KEY --limit 20 --sub-limit 0 \
@@ -724,8 +772,13 @@ linear config show
 linear config set default_output json
 linear config unset default_state_filter
 
+# default_team_id is verified against the workspace; an unknown team is refused
+# and nothing is written.
+linear config set default_team_id ENG
+
 # config show also prints credential_helper (the argv, never the key it fetches).
-# Unset is the only way to change it here — setting it is auth migrate's job.
+# Setting it runs the helper first and refuses to save one that fails.
+linear config set credential_helper "op read op://Private/Linear/api-key"
 linear config unset credential_helper
 ```
 
@@ -777,7 +830,7 @@ Commands marked † infer the issue from the current git branch when the ID is o
 | `linear issue comment list [ID]` † | List an issue's comments |
 | `linear issue comment update CID` | Replace a comment body (`--body` or `--body-file`) |
 | `linear issue comment delete CID` | Delete a comment |
-| `linear issue delete ID` | Archive an issue (supports `--dry-run`, `--bulk*`, `--reason` — reason is echo-only) |
+| `linear issue delete ID` | Archive an issue (supports `--dry-run`, `--bulk*`; there is no `--reason`) |
 | `linear issue start [ID]` † | Check out the issue's git branch and move it to a `started` state |
 | `linear issue pr [ID]` † | Run `gh pr create` with the issue title/URL |
 | `linear issue id\|url\|title [ID]` † | Print one field on a single line (`issue id` makes no request) |
@@ -789,7 +842,7 @@ Commands marked † infer the issue from the current git branch when the ID is o
 | `linear project delete ID` | Archive a project |
 | `linear project add-issue` | Add issue to project |
 | `linear project remove-issue` | Remove issue from project |
-| `linear milestone list` | List a project's milestones (`--project ID\|NAME`, required) |
+| `linear milestone list` | List milestones, workspace-wide or for one project (`--project ID\|NAME`, optional) |
 | `linear milestone view ID` | View one milestone |
 | `linear milestone create` | Create a milestone (`--project`, `--name` required) |
 | `linear milestone update ID` | Update a milestone (name, description, target date, sort order) |
@@ -798,7 +851,7 @@ Commands marked † infer the issue from the current git branch when the ID is o
 | `linear labels list` | List issue labels — ids for `issues list --label` / `issue create --labels` |
 | `linear users list` | List users — ids for `--assignee` (`--include-inactive` adds deactivated members) |
 | `linear states list` | List workflow states — ids for `issues list --state-id` |
-| `linear auth status` | Report which backend supplies the key and whether it validates — never prints it |
+| `linear auth status` | Report which backend supplies the key and whether it is well-formed (offline; never prints it) |
 | `linear auth test` | Validate the current key against the API (`viewer`) |
 | `linear auth migrate --to keychain\|helper CMD...` | Move the plaintext config-file key to a real backend |
 | `linear auth show` | Print the configured key, redacted (`--reveal` needs a TTY) |
@@ -881,8 +934,10 @@ not redirect stderr away.
 | `linear: credential_helper 'CMD' produced something that is not a valid API key; expected 4-512 characters from [A-Za-z0-9_-]` | Stray quotes, a `\r`, or a whole payload on stdout — print the bare key |
 | `linear: /usr/bin/security ...` (the same failure texts, minus `exited N`) | The keychain probe failed. Unlike a helper this is **not** fatal: the chain still falls through to the config file. A non-zero exit from the read means "no such item" and is silent by design |
 | `failed to resolve credentials: api key must be 4-512 characters from [A-Za-z0-9_-]` | Last-resort check on a backend-supplied key (each backend already validates its own output, so this should not normally fire) |
-| `failed to load config: EmptyCredentialHelper` / `TooManyCredentialHelperArgs` / `InvalidCredentialHelperArg` / `InvalidCredentialHelper` | The `credential_helper` value is empty, has more than 16 elements, has an element that is empty or over 1024 bytes, or is not an array of strings (or a bare string) |
-| `config set: credential_helper is set by 'linear auth migrate --to helper <command>', which verifies the helper before storing it` | `config set` cannot verify a helper, and a stored-but-broken one locks you out. `config unset credential_helper` is the only edit `config` makes |
+| `failed to load config: credential_helper must name a command` / `... has too many arguments` / `... arguments must be non-empty and shorter than 1024 bytes` / `... must be an array of strings` | The `credential_helper` value is empty, has more than 16 elements, has an element that is empty or over 1024 bytes, or is not an array of strings (or a bare string) |
+| `config set: credential_helper was not saved` (preceded by the helper's own failure line) | `config set` runs the helper before storing it; a helper that fails, prints nothing, or prints a non-key is refused, because a stored-but-broken one clears the key rather than falling through |
+| `config set: team 'X' not found in workspace; default_team_id was not changed` | The lookup succeeded and the workspace has no such team — check `linear teams list --fields id,key`. Nothing was written |
+| `config set: could not verify team 'X'; default_team_id was not changed` | The lookup itself did not complete (timeout, 5xx, offline) — this is not a verdict on the team. Nothing was written; retry, or pass `--team` per command |
 | `auth migrate: missing --to; expected '--to helper <command>' or '--to keychain'` | `migrate` never picks a backend for you |
 | `auth migrate: no API key in the config file to migrate` | Only an on-disk key is migratable — an environment, helper, or keychain key is not `migrate`'s to move |
 | `auth migrate: '--to helper' needs the command that prints the API key` | Append the argv: `--to helper op read "op://<vault>/<item>/<field>"` |
@@ -903,7 +958,7 @@ not redirect stderr away.
 | `issues list: no fields selected` | `--fields` resolved to an empty set |
 | `issues list: invalid --max-items value` | `--max-items 0` is rejected; omit the flag instead |
 | `issues list: invalid --sort value` | `--sort` takes `created\|updated` optionally suffixed `:asc`/`:desc` — nothing else |
-| `issue delete: invalid --reason value` | `--reason` was empty or whitespace-only |
+| `issue delete: UnknownFlag` on `--reason` | `--reason` was removed — `issueDelete` has no reason parameter, so it never reached Linear. Record it on your side, or leave a comment on the issue before deleting |
 | `issues list: fetched N items across M pages; more available, resume with --cursor XXX` | Not an error — pass `--cursor XXX`, or `--pages N` / `--all` |
 | `issues list: stopped after N items due to --max-items` | Not an error — raise `--max-items` if you need more |
 | `issues list: sub-issues limited to 10; additional sub-issues omitted` | Raise `--sub-limit`, or set `--sub-limit 0` if you never wanted them |
@@ -924,8 +979,10 @@ not redirect stderr away.
 | `<cmd>: cannot read file 'P': <ErrorName>` | Bad path/permissions on a `--*-file` value |
 | `labels list: --limit must be greater than zero` (same for `users`/`states`/`milestone list`/`issue comment list`) | `--limit 0` is rejected; omit the flag for the default of 50 |
 | `labels list: invalid --team value` / `states list: invalid --team value` | `--team` was empty/whitespace |
-| `labels list: more labels available; pagination not implemented (endCursor X)` (same shape for `users`/`states`/`milestone list`/`issue comment list`) | Not an error — these commands do not paginate; raise `--limit` or narrow the filter |
-| `milestone list: --project is required` | Pass `--project ID\|NAME` |
+| `labels list: fetched N items across M pages; more available, resume with --cursor X` (same shape for `users`/`states`/`projects list`/`milestone list`) | Not an error — pass `--cursor X`, or `--pages N` / `--all` |
+| `labels list: stopped after N items due to --max-items` (same shape for the other list commands) | Not an error — raise `--max-items` if you need more |
+| `issue comment list: more comments available; pagination not implemented (endCursor X)` | `issue comment list` does not paginate — raise `--limit` |
+| `<cmd>: ConflictingPageFlags` | `--all` and `--pages` are mutually exclusive; pass one |
 | `milestone list: project 'X' is ambiguous; pass the project id` | Two projects share the slug/name — use the id from `projects list` |
 | `milestone update: provide at least one of --name, --description, --description-file, --target-date, or --sort-order` | Supply a field flag |
 | `milestone create: --project is required` / `milestone create: --name is required` | Both are mandatory |
@@ -1053,7 +1110,7 @@ Commands with `--json` return nested structures. Use these jq paths:
 | `milestone view ID` | `.projectMilestone` | N/A (single object) |
 | `issue comment list [ID]` | `.issue` | `.issue.comments.nodes[]` |
 | `me` | `.viewer` | N/A (single object) |
-| `auth status` | `.` | N/A (flat object; `source`, `key_present`, `key_valid`, `credential_helper`, `keychain_supported`, `file_key_present`, `config_path` — no key) |
+| `auth status` | `.` | N/A (flat object; `source`, `key_present`, `key_format_valid`, `key_verified` (always `null`), `credential_helper`, `keychain_supported`, `file_key_present`, `config_path` — no key) |
 | `search` | `.issues` | `.issues.nodes[]` |
 | `gql --data-only` | `.` (the `data` object) | query-dependent |
 | `gql` (no `--data-only`) | `.data` | query-dependent |

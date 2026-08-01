@@ -283,7 +283,11 @@ pub fn run(ctx: Context) !u8 {
         var response_owned = true;
         errdefer if (response_owned) response.deinit();
 
+        // `errdefer` does not fire on `return 1` — that is a successful return of
+        // an exit code — so a rejected page has to be freed by hand before the
+        // ownership transfer below takes over.
         common.checkResponse(ctx.io, "issues", &response, stderr, api_key) catch {
+            if (response_owned) response.deinit();
             return 1;
         };
 
@@ -624,21 +628,13 @@ pub fn run(ctx: Context) !u8 {
         try printer.printIssueTable(ctx.allocator, &out_writer.interface, rows.items, selected_fields, table_opts);
     }
 
-    if (!ctx.json_output) {
-        const plural = if (page_count == 1) "" else "s";
-        if (more_available) {
-            const cursor_value = last_end_cursor orelse "(unknown)";
-            try stderr.print(
-                "issues list: fetched {d} items across {d} page{s}; more available, resume with --cursor {s}\n",
-                .{ total_fetched, page_count, plural, cursor_value },
-            );
-        } else {
-            try stderr.print("issues list: fetched {d} items across {d} page{s}\n", .{ total_fetched, page_count, plural });
-        }
-    }
-    if (max_items_reached and opts.max_items != null) {
-        try stderr.print("issues list: stopped after {d} items due to --max-items\n", .{total_fetched});
-    }
+    try common.printPageSummary(stderr, "issues list", .{
+        .items = total_fetched,
+        .pages = page_count,
+        .more_available = more_available,
+        .end_cursor = last_end_cursor,
+        .max_items_reached = max_items_reached,
+    }, ctx.json_output);
     if (sub_truncated and sub_enabled) {
         try stderr.print("issues list: sub-issues limited to {d}; additional sub-issues omitted\n", .{opts.sub_limit});
     }

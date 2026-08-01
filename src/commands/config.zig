@@ -3,6 +3,8 @@ const config = @import("config");
 const graphql = @import("graphql");
 const printer = @import("printer");
 const common = @import("common");
+const credentials = @import("credentials");
+const process = @import("process");
 
 const Allocator = std.mem.Allocator;
 
@@ -16,6 +18,9 @@ pub const Context = struct {
     retries: u8,
     timeout_ms: u32,
     endpoint: ?[]const u8 = null,
+    /// `null` means process execution is unavailable, which is what keeps tests
+    /// hermetic. `main.zig` installs `process.system_runner`.
+    credential_runner: ?process.Runner = null,
 };
 
 const ShowOptions = struct {
@@ -33,10 +38,6 @@ const UnsetOptions = struct {
     help: bool = false,
 };
 
-/// `credential_helper` is unset-only here: it is written by
-/// `linear auth migrate --to helper`, which verifies the helper actually
-/// returns the right key before committing it. `config set` has no way to run
-/// that check, and a helper that is stored but broken locks you out.
 const ConfigKey = enum { default_team_id, default_output, default_state_filter, credential_helper };
 
 pub fn run(ctx: Context) !u8 {
@@ -176,20 +177,11 @@ fn runSet(ctx: Context, args: [][]const u8) !u8 {
         return 1;
     }
 
-    if (parsed_key == .credential_helper) {
-        try stderr.print(
-            "config set: credential_helper is set by 'linear auth migrate --to helper <command>', " ++
-                "which verifies the helper before storing it\n",
-            .{},
-        );
-        return 1;
-    }
-
     const save_result = switch (parsed_key) {
         .default_output => setDefaultOutput(ctx, trimmed_value, stderr),
         .default_state_filter => setDefaultStateFilter(ctx, trimmed_value, stderr),
         .default_team_id => setDefaultTeam(ctx, trimmed_value, stderr),
-        .credential_helper => unreachable,
+        .credential_helper => setCredentialHelper(ctx, trimmed_value, stderr),
     };
     save_result catch |err| switch (err) {
         error.InvalidValue => return 1,
@@ -271,6 +263,81 @@ fn setDefaultOutput(ctx: Context, value: []const u8, stderr: anytype) !void {
     return error.InvalidValue;
 }
 
+/// Stores a `credential_helper`, but only after proving the helper works.
+///
+/// This is the only way to configure a helper without the API key touching
+/// disk first. The previous route — `auth set` (plaintext on disk) then
+/// `auth migrate --to helper` then rotate — defeats the point of the backend,
+/// whose entire premise is that the key is never written down.
+///
+/// What made `config set credential_helper` unsafe was the missing
+/// verification, not the command. A stored-but-broken helper is not a soft
+/// failure: `credentials.resolve` *clears* the effective key when a configured
+/// helper fails rather than falling through to any other backend, so saving one
+/// that does not work locks the operator out of their own credential. So the
+/// helper is spawned here and has to hand back a usable key before anything is
+/// written, which is the same bar `auth migrate` holds it to.
+///
+/// The key the helper produces is used for exactly one thing — deciding whether
+/// to save — and is never printed, logged, stored, or returned. Only the argv,
+/// which is operator-supplied configuration rather than a secret, is persisted.
+fn setCredentialHelper(ctx: Context, value: []const u8, stderr: anytype) !void {
+    const runner = ctx.credential_runner orelse {
+        try stderr.print("config set: process execution is unavailable\n", .{});
+        return common.CommandError.CommandFailed;
+    };
+
+    // Whitespace split with no shell semantics, using the same parser the
+    // config file's bare-string form goes through: quotes, pipes, `;`, and
+    // `$VAR` are ordinary bytes inside an argv element.
+    const argv = config.splitCredentialHelper(ctx.allocator, value) catch |err| switch (err) {
+        config.CredentialHelperError.EmptyCredentialHelper => |helper_err| {
+            try stderr.print("config set: {s}\n", .{config.credentialHelperErrorText(helper_err)});
+            return error.InvalidValue;
+        },
+        else => return err,
+    };
+    defer ctx.allocator.free(argv);
+
+    // Bounds first, so an argv that could never be stored is never spawned.
+    config.validateCredentialHelper(argv) catch |err| {
+        try stderr.print("config set: {s}\n", .{config.credentialHelperErrorText(err)});
+        return error.InvalidValue;
+    };
+
+    const name = try credentials.helperName(ctx.allocator, argv);
+    defer ctx.allocator.free(name);
+
+    const outcome = try credentials.runHelper(runner, ctx.allocator, ctx.io, argv);
+    defer outcome.deinit(ctx.allocator);
+
+    switch (outcome) {
+        // Discarded without ever being looked at beyond `runHelper`'s own
+        // validation. Nothing below this line can reach the key.
+        .key => {},
+        // `runHelper` never reports `absent`: exit 0 with no output is a
+        // failure, not an empty store.
+        .absent => unreachable,
+        .failure => |failure| {
+            try credentials.printFailure(failure, name, stderr, "config set");
+            try stderr.print("config set: credential_helper was not saved\n", .{});
+            return error.InvalidValue;
+        },
+    }
+
+    ctx.config.setCredentialHelper(argv) catch |err| switch (err) {
+        config.CredentialHelperError.EmptyCredentialHelper,
+        config.CredentialHelperError.TooManyCredentialHelperArgs,
+        config.CredentialHelperError.InvalidCredentialHelperArg,
+        config.CredentialHelperError.InvalidCredentialHelper,
+        => |helper_err| {
+            try stderr.print("config set: {s}\n", .{config.credentialHelperErrorText(helper_err)});
+            return error.InvalidValue;
+        },
+        else => return err,
+    };
+}
+
 fn setDefaultStateFilter(ctx: Context, value: []const u8, stderr: anytype) !void {
     const parsed = parseStateFilterValues(ctx.allocator, value) catch |err| {
         try stderr.print("config set: {s}\n", .{@errorName(err)});
@@ -281,6 +348,25 @@ fn setDefaultStateFilter(ctx: Context, value: []const u8, stderr: anytype) !void
     try ctx.config.setStateFilterValues(parsed);
 }
 
+/// Validates the team against the workspace and only then persists it.
+///
+/// The two ways validation can end are kept apart on purpose, because they mean
+/// opposite things to the operator:
+///
+///   * `error.InvalidTeam` — the lookup succeeded and the workspace has no such
+///     team. That is a verdict, so it is a hard failure and nothing is written.
+///     Warning and saving anyway (what this used to do) is worse than not
+///     checking at all: the exit status says the value was accepted, and the
+///     mistake only surfaces at the next command that needs a team.
+///   * anything else — the lookup itself did not complete (timeout, 5xx, no
+///     connectivity). That is not evidence the team is wrong, so the diagnostic
+///     names the lookup as the thing that failed. The underlying cause was
+///     already printed by `common.send`/`checkResponse`.
+///
+/// Both paths refuse to write, and neither pretends to be the other. There is
+/// deliberately no `--force`: an unverified team id is exactly what this
+/// function exists to keep out of the config file, and `linear config unset
+/// default_team_id` plus a per-command `--team` covers working offline.
 fn setDefaultTeam(ctx: Context, value: []const u8, stderr: anytype) !void {
     const api_key = common.requireApiKey(ctx.config, null, stderr, "config set") catch {
         return common.CommandError.CommandFailed;
@@ -294,9 +380,20 @@ fn setDefaultTeam(ctx: Context, value: []const u8, stderr: anytype) !void {
 
     validateTeamSelection(ctx, &client, value, stderr) catch |err| switch (err) {
         error.InvalidTeam => {
-            try stderr.print("config set: warning: team '{s}' not found in workspace\n", .{value});
+            try stderr.print(
+                "config set: team '{s}' not found in workspace; default_team_id was not changed\n",
+                .{value},
+            );
+            try stderr.print("config set: run 'linear teams list' to see the available team keys\n", .{});
+            return error.InvalidValue;
         },
-        else => return common.CommandError.CommandFailed,
+        else => {
+            try stderr.print(
+                "config set: could not verify team '{s}'; default_team_id was not changed\n",
+                .{value},
+            );
+            return common.CommandError.CommandFailed;
+        },
     };
 
     try ctx.config.setDefaultTeamId(value);
@@ -523,18 +620,28 @@ pub fn setUsage(writer: anytype) !void {
     try writer.print(
         \\Usage: linear config set KEY VALUE [--help]
         \\Keys:
-        \\  default_team_id       Default team for commands (team key or UUID)
+        \\  default_team_id       Default team for commands (team key or UUID).
+        \\                        Verified against the workspace; an unknown team
+        \\                        is refused and nothing is written.
         \\  default_output        Default output format: table|json
         \\  default_state_filter  Comma-separated state types to exclude by default
-        \\Read-only here:
-        \\  credential_helper     Set by 'linear auth migrate --to helper <command>';
-        \\                        remove with 'linear config unset credential_helper'
+        \\  credential_helper     External command whose stdout is the API key.
+        \\                        Run once and required to return a usable key
+        \\                        before it is saved; a broken helper is refused,
+        \\                        because a stored one clears the key instead of
+        \\                        falling through to another backend.
+        \\                        Split on whitespace into argv with NO shell
+        \\                        semantics: quotes, pipes, ';' and $VAR are
+        \\                        ordinary characters. Max 16 arguments, 1024
+        \\                        bytes each. Remove it with
+        \\                        'linear config unset credential_helper'.
         \\Flags:
         \\  --help                Show this help message
         \\Examples:
         \\  linear config set default_team_id ENG
         \\  linear config set default_output json
         \\  linear config set default_state_filter completed,canceled
+        \\  linear config set credential_helper "op read op://Private/Linear/api-key"
         \\
     , .{});
 }

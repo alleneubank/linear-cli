@@ -316,11 +316,17 @@ fn runShow(ctx: Context, args: [][]const u8) !u8 {
     return 0;
 }
 
-/// Reports which backend supplied the key and whether it is usable.
+/// Reports which backend supplied the key and whether it is well-formed.
 ///
 /// This is the diagnostic that replaces the urge to run `auth show`: it answers
 /// "where is my credential coming from and does it look right" without the key
 /// ever reaching stdout, stderr, or a JSON document.
+///
+/// Deliberately offline: the only check it can make is the charset/length one,
+/// so it never claims more than that. A key that Linear has revoked, or a
+/// fixture string like `test-key`, is `format-valid` here and still worthless —
+/// `auth test` is the only command that round-trips the credential against the
+/// API, and every label here points at it rather than implying it already ran.
 fn runStatus(ctx: Context, args: [][]const u8) !u8 {
     var stderr_buf: [0]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
@@ -342,10 +348,11 @@ fn runStatus(ctx: Context, args: [][]const u8) !u8 {
 
     const cfg = ctx.config;
     const key_present = cfg.api_key != null;
-    // A key that reached `Config` has already been validated, so this can only
-    // disagree if a future ingestion point forgets to check. Recomputing it
-    // here is what makes that a visible `invalid` instead of a 401 later.
-    const key_valid = if (cfg.api_key) |key| config.isValidApiKey(key) else false;
+    // Charset and length only — this says the key *could* be sent, not that it
+    // works. A key that reached `Config` has already been validated, so this can
+    // only disagree if a future ingestion point forgets to check. Recomputing it
+    // here is what makes that a visible `malformed` instead of a 401 later.
+    const key_format_valid = if (cfg.api_key) |key| config.isValidApiKey(key) else false;
 
     var helper_display: ?[]u8 = null;
     defer if (helper_display) |value| ctx.allocator.free(value);
@@ -362,8 +369,15 @@ fn runStatus(ctx: Context, args: [][]const u8) !u8 {
         try jw.write(@tagName(cfg.key_source));
         try jw.objectField("key_present");
         try jw.write(key_present);
-        try jw.objectField("key_valid");
-        try jw.write(key_valid);
+        // `key_valid` used to live here and meant only this much; it was renamed
+        // rather than kept, so a consumer reading the old name fails loudly
+        // instead of silently believing the key was checked against the API.
+        try jw.objectField("key_format_valid");
+        try jw.write(key_format_valid);
+        // Never anything but null: this command does not touch the network, and
+        // a `false` here would read as "checked and rejected".
+        try jw.objectField("key_verified");
+        try jw.write(null);
         try jw.objectField("credential_helper");
         if (cfg.credential_helper) |argv| {
             try jw.beginArray();
@@ -382,17 +396,18 @@ fn runStatus(ctx: Context, args: [][]const u8) !u8 {
 
         try out.writeAll(json_buffer.writer.buffered());
         try out.writeByte('\n');
-        return if (key_present and key_valid) 0 else 1;
+        return if (key_present and key_format_valid) 0 else 1;
     }
 
     const pairs = [_]printer.KeyValue{
         .{ .key = "source", .value = cfg.key_source.label() },
         .{ .key = "key", .value = if (!key_present)
             "absent"
-        else if (key_valid)
-            "present (valid)"
+        else if (key_format_valid)
+            "present (format-valid, unverified)"
         else
-            "present (invalid)" },
+            "present (malformed)" },
+        .{ .key = "verify", .value = "run 'linear auth test' to check the key against the API" },
         .{ .key = "credential_helper", .value = helper_display orelse "(not set)" },
         .{ .key = "keychain", .value = if (credentials.keychain_supported)
             credentials.keychain_binary
@@ -406,7 +421,7 @@ fn runStatus(ctx: Context, args: [][]const u8) !u8 {
     };
     try printer.printKeyValues(out, pairs[0..]);
 
-    return if (key_present and key_valid) 0 else 1;
+    return if (key_present and key_format_valid) 0 else 1;
 }
 
 /// Moves the plaintext key out of the config file and into a real backend.
@@ -780,8 +795,13 @@ pub fn showUsage(writer: anytype) !void {
 pub fn statusUsage(writer: anytype) !void {
     try writer.print(
         \\Usage: linear auth status [--help]
-        \\Reports which backend supplied the API key and whether it is usable.
-        \\The key itself is never printed. Exits 0 when a usable key was found.
+        \\Reports which backend supplied the API key and whether it is well-formed.
+        \\The key itself is never printed. Exits 0 when a well-formed key was found.
+        \\
+        \\Offline by design: 'format-valid' means the key matches the expected
+        \\charset and length, nothing more. It has not been sent to Linear, so a
+        \\revoked or wrong key still reports format-valid. Run 'linear auth test'
+        \\to verify the credential against the API.
         \\Resolution order:
         \\  LINEAR_API_KEY > credential_helper > keychain (macOS) > config file
         \\Flags:
@@ -789,6 +809,7 @@ pub fn statusUsage(writer: anytype) !void {
         \\Examples:
         \\  linear auth status
         \\  linear auth status --json
+        \\  linear auth test
         \\
     , .{});
 }

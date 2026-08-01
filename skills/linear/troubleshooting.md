@@ -69,18 +69,26 @@ linear auth migrate --to helper op read "op://<vault>/<item>/<field>"
 ```
 
 `auth status` is the first command to run for any auth question, because a 401 does not say *which* of the
-four backends produced the offending key. It prints the source, whether a key is present and valid, the
-configured `credential_helper` argv, whether the keychain backend exists on this platform, whether a
-plaintext key is still in the config file, and the config path — and exits 1 when no usable key was found:
+four backends produced the offending key. It prints the source, whether a key is present and well-formed,
+the configured `credential_helper` argv, whether the keychain backend exists on this platform, whether a
+plaintext key is still in the config file, and the config path — and exits 1 when no well-formed key was
+found:
 
 ```
 source           : credential_helper
-key              : present (valid)
+key              : present (format-valid, unverified)
+verify           : run 'linear auth test' to check the key against the API
 credential_helper: op read op://Private/Linear/api-key
 keychain         : /usr/bin/security
 file_api_key     : absent
 config_path      : /Users/you/.config/linear/config.json
 ```
+
+`format-valid` is a charset/length check and nothing more — `auth status` makes no network request, so a
+revoked key still reports `format-valid`. It answers "where is my credential coming from", not "does it
+work"; `linear auth test` answers the second question. A key that fails even the charset check reports
+`present (malformed)`. Under `--json` these are `key_present`, `key_format_valid`, and `key_verified`
+(always `null`).
 
 **Never print the key.** `linear auth status` answers "where is my credential coming from" without the key
 reaching any stream — not stdout, not stderr, not the `--json` object, not even a redacted fingerprint —
@@ -112,12 +120,14 @@ supplying the key somewhere else lower in the chain.
 **Solution:**
 ```bash
 # Option 1 (preferred): point a credential_helper at your secret manager.
-# migrate only *moves* a key that is already in the config file — it uploads
-# nothing — so store the key in the manager first, then land it on disk once.
-op read "op://<vault>/<item>/<field>" | linear auth set
-linear auth migrate --to helper op read "op://<vault>/<item>/<field>"
+# The key never touches disk: store it in the manager, then point the helper
+# at it. `config set` runs the helper once and refuses to save a broken one.
+linear config set credential_helper "op read op://<vault>/<item>/<field>"
+linear auth test
 
-# Option 2 (macOS, no secret manager): the login keychain. Same bootstrap.
+# Option 2 (macOS, no secret manager): the login keychain. This one still needs
+# the bootstrap, because migrate moves a key that is already in the config file.
+op read "op://<vault>/<item>/<field>" | linear auth set
 linear auth migrate --to keychain
 
 # Option 3: environment variable (read on every run, never written to the config file)
@@ -128,11 +138,11 @@ linear auth test
 linear auth set
 ```
 
-Prefer option 1. Option 4 stores the key in cleartext and makes the CLI warn on every run that reads it
-(`warning: API key read from ...; the config file stores it in plaintext.`); it survives mainly as the
-step `auth migrate` migrates *from* — there is no other way to install a `credential_helper` from the CLI,
-since `config set credential_helper` is refused. A literal key typed after `export` lands in shell history
-and in the environment of every child process.
+Prefer option 1: it is the only route where the key is never written to disk at all. Option 4 stores the
+key in cleartext and makes the CLI warn on every run that reads it (`warning: API key read from ...; the
+config file stores it in plaintext.`); it survives as the step `auth migrate` migrates *from*, which is
+what you need when a plaintext key is already on disk. A literal key typed after `export` lands in shell
+history and in the environment of every child process.
 
 Nothing but the config file is ever written to disk: a key from the environment, a helper, or the keychain
 is never persisted, and a key already in the config file survives saves made while one of them is
@@ -328,7 +338,7 @@ linear issues list --team TEAM_KEY --updated-since 2026-01-01T00:00:00Z \
 ```
 
 The same applies to the other id-only filters — `linear labels list --team KEY`,
-`linear users list`, and `linear milestone list --project ID|NAME` enumerate the candidates for
+`linear users list`, and `linear milestone list [--project ID|NAME]` enumerate the candidates for
 `--label`, `--assignee`, and `--milestone`. Add `--quiet` for bare ids. No `gql` query is needed for any
 of them.
 
@@ -338,10 +348,9 @@ of them.
 
 ```
 labels list: invalid --team value
-milestone list: --project is required
 milestone list: project 'X' not found
 milestone list: project 'X' is ambiguous; pass the project id
-labels list: more labels available; pagination not implemented (endCursor XXX)
+labels list: fetched 50 items across 1 page; more available, resume with --cursor XXX
 ```
 
 **Causes and fixes:**
@@ -349,10 +358,12 @@ labels list: more labels available; pagination not implemented (endCursor XXX)
 - `--team` filters `labels list` and `states list` on the team's key or id, so a workspace-level label
   that belongs to no team is excluded by it — drop `--team` to see those. `users list` has no `--team`.
 - `users list` hides deactivated members by default. Add `--include-inactive` to see them.
-- `milestone list` **requires** `--project`, and a non-UUID value is matched against the project slug or
-  its exact name. Two matches is an error — take the id from `linear projects list --fields id,name`.
-- None of these commands paginate. The "more available" notice means the result was cut at `--limit`
-  (default 50); raise it or narrow the filter.
+- `milestone list --project` is optional; without it the listing spans every project, and the `Project`
+  column tells the rows apart. A non-UUID value is matched against the project slug or its exact name.
+  Two matches is an error — take the id from `linear projects list --fields id,name`.
+- These commands paginate. The "more available" notice means the walk hit its page budget (one page by
+  default), not that rows were lost: re-run with `--all`, `--pages N`, or `--cursor XXX` to continue.
+  `--max-items N` caps the total if you only want a bounded slice.
 
 ```bash
 linear labels list --team TEAM_KEY --limit 100 --fields id,name --data-only
@@ -786,13 +797,14 @@ value must still parse as a URL with a host.
 
 ### Step 1: Verify Authentication
 ```bash
-linear auth status   # which backend, and is the key usable — never prints the key
-linear auth test     # does the key actually authenticate
+linear auth status   # which backend, and is the key well-formed — offline, never prints the key
+linear auth test     # does the key actually authenticate — the only real check
 ```
 
-Expected: `auth status` exits 0 and names a source; `auth test` shows your user info. If `auth status`
-reports `source: credential_helper (failed)`, stop here — nothing downstream will work until the helper is
-fixed or unset.
+Expected: `auth status` exits 0 and names a source; `auth test` shows your user info. `auth status` alone
+is not proof the key works: it never leaves the machine, so `format-valid (unverified)` covers a revoked
+key too. If `auth status` reports `source: credential_helper (failed)`, stop here — nothing downstream will
+work until the helper is fixed or unset.
 
 ### Step 2: Check Team Access
 ```bash
@@ -867,12 +879,21 @@ field is still there it holds the key in cleartext, and dumping it puts a live c
 transcript. `linear auth status` answers which backend the key comes from without printing it, and
 `file_api_key: present (deprecated plaintext)` in that output is what tells you the file still holds one.
 
-`credential_helper` can be **unset** here but not set — `linear auth migrate --to helper <command>` is the
-only writer, because it verifies the helper before storing it:
+`credential_helper` can be set and unset here. `config set` runs the helper once before storing it and
+refuses to save one that fails, prints nothing, or prints something that is not a key — a stored-but-broken
+helper clears the effective key rather than falling through, so it would lock you out:
 
 ```bash
+# Bootstrap a helper with the key never touching disk.
+linear config set credential_helper "op read op://<vault>/<item>/<field>"
+
+# The escape hatch, which needs no key and spawns nothing.
 linear config unset credential_helper
 ```
+
+The value is split on ASCII whitespace into argv with **no** shell semantics (quotes, pipes, `;`, `$VAR`
+are ordinary bytes), capped at 16 arguments of 1024 bytes each, and those bounds are checked before
+anything is spawned.
 
 ### Reset Config
 ```bash
@@ -881,10 +902,9 @@ linear auth status
 ```
 
 Removing the file drops `credential_helper` along with the defaults, so re-point the helper afterwards
-(`linear auth migrate --to helper ...` needs a key in the config file, so set the helper up before
-resetting, or use `LINEAR_API_KEY` in the meantime). A **keychain** item is not stored in the config file
-and survives the delete — on macOS `linear auth status` may well still report `source: keychain` with no
-config file at all.
+with `linear config set credential_helper "<command>"` — that needs no key on disk. A **keychain** item is
+not stored in the config file and survives the delete — on macOS `linear auth status` may well still
+report `source: keychain` with no config file at all.
 
 Deleting the file is not a secure erase of a key it contained — see
 [Moving a Plaintext Key Off Disk](#moving-a-plaintext-key-off-disk) and rotate the key.

@@ -19,7 +19,12 @@ pub const Context = struct {
 
 const Options = struct {
     team: ?[]const u8 = null,
+    /// Page size per request, not a total; `--max-items` caps the total.
     limit: usize = 50,
+    max_items: ?usize = null,
+    cursor: ?[]const u8 = null,
+    pages: ?usize = null,
+    all: bool = false,
     fields: ?[]const u8 = null,
     plain: bool = false,
     no_truncate: bool = false,
@@ -43,6 +48,7 @@ pub fn run(ctx: Context) !u8 {
     const opts = parseOptions(ctx.args) catch |err| {
         const message = switch (err) {
             error.InvalidLimit => "invalid --limit value",
+            error.InvalidPageCount => "invalid --pages value",
             else => @errorName(err),
         };
         try stderr.print("states list: {s}\n", .{message});
@@ -76,6 +82,12 @@ pub fn run(ctx: Context) !u8 {
         try stderr.print("states list: --limit must be greater than zero\n", .{});
         return 1;
     }
+    if (opts.max_items) |max_value| {
+        if (max_value == 0) {
+            try stderr.print("states list: invalid --max-items value\n", .{});
+            return 1;
+        }
+    }
     const disable_trunc = opts.plain or opts.no_truncate;
     const table_opts = printer.TableOptions{
         .pad = !disable_trunc,
@@ -86,10 +98,11 @@ pub fn run(ctx: Context) !u8 {
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
-    const limit_i64 = std.math.cast(i64, opts.limit) orelse return error.InvalidLimit;
-    try variables.object.put(var_alloc, "first", .{ .integer = limit_i64 });
+    const page_size = opts.limit;
+    const limit_i64 = std.math.cast(i64, page_size) orelse return error.InvalidLimit;
 
+    // Built once and reused by every page; only `after` changes between requests.
+    var team_filter: ?std.json.Value = null;
     if (opts.team) |team_raw| {
         const trimmed = std.mem.trim(u8, team_raw, " \t");
         if (trimmed.len == 0) {
@@ -108,12 +121,12 @@ pub fn run(ctx: Context) !u8 {
 
         var filter = std.json.Value{ .object = std.json.ObjectMap.empty };
         try filter.object.put(var_alloc, "team", team_obj);
-        try variables.object.put(var_alloc, "filter", filter);
+        team_filter = filter;
     }
 
     const query =
-        \\query WorkflowStates($first: Int!, $filter: WorkflowStateFilter) {
-        \\  workflowStates(first: $first, filter: $filter) {
+        \\query WorkflowStates($first: Int!, $after: String, $filter: WorkflowStateFilter) {
+        \\  workflowStates(first: $first, after: $after, filter: $filter) {
         \\    nodes { id name type position team { key } }
         \\    pageInfo { hasNextPage endCursor }
         \\  }
@@ -126,80 +139,159 @@ pub fn run(ctx: Context) !u8 {
     client.timeout_ms = ctx.timeout_ms;
     if (ctx.endpoint) |ep| client.endpoint = ep;
 
-    var response = common.send(ctx.allocator, "states list", &client, .{
-        .query = query,
-        .variables = variables,
-        .operation_name = "WorkflowStates",
-    }, stderr) catch {
-        return 1;
-    };
-    defer response.deinit();
-
-    common.checkResponse(ctx.io, "states list", &response, stderr, api_key) catch {
-        return 1;
-    };
-
-    const data_value = response.data() orelse {
-        try stderr.print("states list: response missing data\n", .{});
-        return 1;
-    };
-
     const want_table = !ctx.json_output and !opts.data_only and !opts.quiet;
     const want_data_rows = opts.data_only or opts.quiet;
     const want_raw_nodes = ctx.json_output and !opts.data_only and !opts.quiet;
 
-    if (want_raw_nodes) {
-        var out_buf: [0]u8 = undefined;
-        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
-        try printer.printJson(data_value, &out_writer.interface, true);
-        return 0;
+    // Row fields are slices borrowed from each page's parsed body, so no page
+    // may be freed until every row has been printed; the whole `Response` is
+    // kept and released together at the end.
+    var responses = std.ArrayListUnmanaged(graphql.GraphqlClient.Response).empty;
+    defer {
+        for (responses.items) |*resp| resp.deinit();
+        responses.deinit(ctx.allocator);
     }
-
-    const states_obj = common.getObjectField(data_value, "workflowStates") orelse {
-        try stderr.print("states list: workflowStates not found in response\n", .{});
-        return 1;
-    };
-    const nodes_array = common.getArrayField(states_obj, "nodes") orelse {
-        try stderr.print("states list: nodes missing in response\n", .{});
-        return 1;
-    };
-    const page_info = common.getObjectField(states_obj, "pageInfo");
-    const has_next = if (page_info) |pi| common.getBoolField(pi, "hasNextPage") orelse false else false;
-    const end_cursor = if (page_info) |pi| common.getStringField(pi, "endCursor") else null;
 
     var rows = std.ArrayListUnmanaged(printer.StateRow).empty;
     defer rows.deinit(ctx.allocator);
     var data_rows = std.ArrayListUnmanaged(DataRow).empty;
     defer data_rows.deinit(ctx.allocator);
+    var nodes_accumulator = std.ArrayListUnmanaged(std.json.Value).empty;
+    defer nodes_accumulator.deinit(ctx.allocator);
 
-    for (nodes_array.items) |node| {
-        if (node != .object) continue;
-        const id = common.getStringField(node, "id") orelse continue;
-        const name = common.getStringField(node, "name") orelse "";
-        const type_value = common.getStringField(node, "type") orelse "";
-        const position = try formatPosition(var_alloc, node);
-        const team_obj = common.getObjectField(node, "team");
-        const team_key = if (team_obj) |t| common.getStringField(t, "key") orelse "" else "";
+    var progress = common.PageProgress{};
+    var next_cursor = opts.cursor;
+    const page_limit: ?usize = if (opts.all) null else opts.pages orelse 1;
 
-        if (want_table) {
-            try rows.append(ctx.allocator, .{
-                .id = id,
-                .name = name,
-                .type = type_value,
-                .position = position,
-                .team = team_key,
-            });
+    while (true) {
+        if (page_limit) |limit_pages| {
+            if (progress.pages >= limit_pages) break;
         }
-        if (want_data_rows) {
-            try data_rows.append(ctx.allocator, .{
-                .id = id,
-                .name = name,
-                .type = type_value,
-                .position = position,
-                .team = team_key,
-            });
+
+        var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try variables.object.put(var_alloc, "first", .{ .integer = limit_i64 });
+        if (next_cursor) |cursor_value| try variables.object.put(var_alloc, "after", .{ .string = cursor_value });
+        if (team_filter) |filter| try variables.object.put(var_alloc, "filter", filter);
+
+        var response = common.send(ctx.allocator, "states list", &client, .{
+            .query = query,
+            .variables = variables,
+            .operation_name = "WorkflowStates",
+        }, stderr) catch {
+            return 1;
+        };
+        var response_owned = true;
+        errdefer if (response_owned) response.deinit();
+
+        // `errdefer` does not fire on `return 1` — that is a successful return
+        // of an exit code — so a rejected page is freed by hand here.
+        common.checkResponse(ctx.io, "states list", &response, stderr, api_key) catch {
+            if (response_owned) response.deinit();
+            return 1;
+        };
+
+        try responses.append(ctx.allocator, response);
+        response_owned = false;
+        const resp = &responses.items[responses.items.len - 1];
+
+        const data_value = resp.data() orelse {
+            try stderr.print("states list: response missing data\n", .{});
+            return 1;
+        };
+        const states_obj = common.getObjectField(data_value, "workflowStates") orelse {
+            try stderr.print("states list: workflowStates not found in response\n", .{});
+            return 1;
+        };
+        const nodes_array = common.getArrayField(states_obj, "nodes") orelse {
+            try stderr.print("states list: nodes missing in response\n", .{});
+            return 1;
+        };
+
+        if (opts.max_items) |max_value| {
+            if (progress.items >= max_value) {
+                progress.max_items_reached = true;
+                break;
+            }
         }
+
+        const take_count = @min(nodes_array.items.len, page_size);
+        const remaining_allowed = if (opts.max_items) |max_value| max_value - progress.items else take_count;
+        const allowed_count = @min(take_count, remaining_allowed);
+        const page_nodes = nodes_array.items[0..allowed_count];
+
+        progress.items += allowed_count;
+        if (opts.max_items) |max_value| {
+            if (progress.items >= max_value) progress.max_items_reached = true;
+        }
+        progress.pages += 1;
+
+        if (want_raw_nodes) {
+            for (page_nodes) |node| try nodes_accumulator.append(ctx.allocator, node);
+        }
+
+        if (want_table or want_data_rows) {
+            for (page_nodes) |node| {
+                if (node != .object) continue;
+                const id = common.getStringField(node, "id") orelse continue;
+                const name = common.getStringField(node, "name") orelse "";
+                const type_value = common.getStringField(node, "type") orelse "";
+                const position = try formatPosition(var_alloc, node);
+                const team_obj = common.getObjectField(node, "team");
+                const team_key = if (team_obj) |t| common.getStringField(t, "key") orelse "" else "";
+
+                if (want_table) {
+                    try rows.append(ctx.allocator, .{
+                        .id = id,
+                        .name = name,
+                        .type = type_value,
+                        .position = position,
+                        .team = team_key,
+                    });
+                }
+                if (want_data_rows) {
+                    try data_rows.append(ctx.allocator, .{
+                        .id = id,
+                        .name = name,
+                        .type = type_value,
+                        .position = position,
+                        .team = team_key,
+                    });
+                }
+            }
+        }
+
+        const page_info = common.getObjectField(states_obj, "pageInfo");
+        const has_next = if (page_info) |pi| common.getBoolField(pi, "hasNextPage") orelse false else false;
+        progress.end_cursor = if (page_info) |pi| common.getStringField(pi, "endCursor") else null;
+        progress.more_available = has_next;
+
+        if (allowed_count < take_count and opts.max_items != null) {
+            progress.max_items_reached = true;
+        }
+
+        if (take_count == 0 or allowed_count == 0) {
+            if (has_next) {
+                try stderr.print("states list: received empty page; stopping pagination\n", .{});
+            }
+            break;
+        }
+
+        if (!has_next) break;
+        if (page_limit) |limit_pages| {
+            if (progress.pages >= limit_pages) break;
+        }
+        if (progress.max_items_reached) {
+            progress.more_available = true;
+            break;
+        }
+        if (progress.end_cursor == null) {
+            try stderr.print("states list: missing endCursor for additional page\n", .{});
+            break;
+        }
+        next_cursor = progress.end_cursor;
     }
+
+    if (progress.max_items_reached) progress.more_available = true;
 
     var out_buf: [0]u8 = undefined;
     var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
@@ -222,13 +314,7 @@ pub fn run(ctx: Context) !u8 {
             }
             var root_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
             try root_obj.object.put(var_alloc, "nodes", .{ .array = out_array });
-
-            var page_info_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
-            try page_info_obj.object.put(var_alloc, "hasNextPage", .{ .bool = has_next });
-            if (end_cursor) |cursor_value| {
-                try page_info_obj.object.put(var_alloc, "endCursor", .{ .string = cursor_value });
-            }
-            try root_obj.object.put(var_alloc, "pageInfo", page_info_obj);
+            try root_obj.object.put(var_alloc, "pageInfo", try pageInfoValue(var_alloc, progress));
             try root_obj.object.put(var_alloc, "limit", .{ .integer = limit_i64 });
             try printer.printJson(root_obj, stdout_iface, true);
         } else {
@@ -241,16 +327,34 @@ pub fn run(ctx: Context) !u8 {
                 try stdout_iface.writeByte('\n');
             }
         }
+    } else if (want_raw_nodes) {
+        var nodes_value = std.json.Value{ .array = std.json.Array.init(var_alloc) };
+        try nodes_value.array.appendSlice(nodes_accumulator.items);
+
+        var states_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try states_obj.object.put(var_alloc, "nodes", nodes_value);
+        try states_obj.object.put(var_alloc, "pageInfo", try pageInfoValue(var_alloc, progress));
+
+        var root_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try root_obj.object.put(var_alloc, "workflowStates", states_obj);
+        try printer.printJson(root_obj, stdout_iface, true);
     } else {
         try printer.printStateTable(ctx.allocator, stdout_iface, rows.items, selected_fields, table_opts);
     }
 
-    if (has_next and !ctx.json_output) {
-        const cursor_value = end_cursor orelse "(unknown)";
-        try stderr.print("states list: more states available; pagination not implemented (endCursor {s})\n", .{cursor_value});
-    }
-
+    try common.printPageSummary(stderr, "states list", progress, ctx.json_output);
     return 0;
+}
+
+/// Renders the walk's final cursor state in the same `pageInfo` shape the API
+/// uses, so a `--json` consumer can resume with `--cursor` unchanged.
+fn pageInfoValue(allocator: Allocator, progress: common.PageProgress) !std.json.Value {
+    var page_info = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try page_info.object.put(allocator, "hasNextPage", .{ .bool = progress.more_available });
+    if (progress.end_cursor) |cursor_value| {
+        try page_info.object.put(allocator, "endCursor", .{ .string = cursor_value });
+    }
+    return page_info;
 }
 
 /// `WorkflowState.position` is a GraphQL Float, so it arrives as a JSON number
@@ -320,6 +424,48 @@ pub fn parseOptions(args: []const []const u8) !Options {
             idx += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--max-items")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.max_items = try std.fmt.parseInt(usize, args[idx + 1], 10);
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--max-items=")) {
+            opts.max_items = try std.fmt.parseInt(usize, arg["--max-items=".len..], 10);
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--cursor")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.cursor = args[idx + 1];
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--cursor=")) {
+            opts.cursor = arg["--cursor=".len..];
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pages")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            const value = try std.fmt.parseInt(usize, args[idx + 1], 10);
+            if (value == 0) return error.InvalidPageCount;
+            opts.pages = value;
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--pages=")) {
+            const value = try std.fmt.parseInt(usize, arg["--pages=".len..], 10);
+            if (value == 0) return error.InvalidPageCount;
+            opts.pages = value;
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--all")) {
+            opts.all = true;
+            idx += 1;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--fields")) {
             if (idx + 1 >= args.len) return error.MissingValue;
             opts.fields = args[idx + 1];
@@ -354,6 +500,7 @@ pub fn parseOptions(args: []const []const u8) !Options {
         if (arg.len > 0 and arg[0] == '-') return error.UnknownFlag;
         return error.UnexpectedArgument;
     }
+    if (opts.all and opts.pages != null) return error.ConflictingPageFlags;
     return opts;
 }
 
@@ -365,10 +512,14 @@ fn parseLimit(raw: []const u8) !usize {
 
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear states list [--team ID|KEY] [--limit N] [--fields LIST] [--plain] [--no-truncate] [--quiet] [--data-only] [--help]
+        \\Usage: linear states list [--team ID|KEY] [--limit N] [--max-items N] [--cursor CURSOR] [--pages N|--all] [--fields LIST] [--plain] [--no-truncate] [--quiet] [--data-only] [--help]
         \\Flags:
         \\  --team ID|KEY    Filter by team id or key (omitted: every team's states, disambiguated by the Team column)
-        \\  --limit N        Number of workflow states to fetch (default: 50)
+        \\  --limit N        Page size per request (default: 50)
+        \\  --max-items N    Stop after emitting N states (may truncate within a page)
+        \\  --cursor CURSOR  Start pagination after the provided cursor
+        \\  --pages N        Fetch up to N pages (default: 1)
+        \\  --all            Fetch all pages until the end
         \\  --fields LIST    Comma-separated columns (id,name,type,position,team)
         \\  --plain          Do not pad or truncate table cells
         \\  --no-truncate    Disable ellipsis and padding in table cells
@@ -378,7 +529,7 @@ pub fn usage(writer: anytype) !void {
         \\Examples:
         \\  linear states list --team ENG
         \\  linear states list --team ENG --fields id,name --data-only
-        \\  linear states list --fields id,name,team --data-only
+        \\  linear states list --all --fields id,name,team --data-only
         \\  linear issues list --team ENG --state-id <id from 'linear states list'>
         \\
     , .{});

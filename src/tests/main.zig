@@ -469,7 +469,7 @@ test "config command validates team selection" {
     try std.testing.expectEqualStrings("team-id-1", persisted);
 }
 
-test "config command warns on unknown team but still sets value" {
+test "config command refuses to save an unknown team" {
     const allocator = std.testing.allocator;
 
     var server = mock_graphql.MockServer.init(allocator);
@@ -512,9 +512,73 @@ test "config command warns on unknown team but still sets value" {
     const capture = try captureOutput(allocator, &runner, runConfig);
     defer capture.deinit(allocator);
 
-    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "warning: team 'MISSING' not found") != null);
-    try std.testing.expectEqualStrings("MISSING", cfg.default_team_id);
+    // A lookup that succeeded and found nothing is a verdict, not a warning:
+    // persisting the value anyway would report success for a team id that fails
+    // at the next command that needs one.
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "team 'MISSING' not found in workspace") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "was not changed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "teams list") != null);
+    try std.testing.expectEqual(@as(usize, 0), cfg.default_team_id.len);
+    try std.testing.expectEqualStrings("", capture.stdout);
+
+    // Nothing reached the config file either, so there is no bad value to find
+    // on the next run.
+    var reloaded = try config.load(allocator, test_io, testEnviron(), config_path);
+    defer reloaded.deinit();
+    try std.testing.expectEqual(@as(usize, 0), reloaded.default_team_id.len);
+}
+
+test "config command separates a failed team lookup from a missing team" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    // No `TeamLookup` fixture: the request itself fails, which stands in for a
+    // timeout, a 5xx, or no connectivity. The workspace was never asked, so the
+    // team is unverified rather than known-bad.
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(test_io, ".", allocator);
+    defer allocator.free(dir_path);
+    const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+    defer allocator.free(config_path);
+
+    var cfg = try config.load(allocator, test_io, testEnviron(), config_path);
+    defer cfg.deinit();
+    try cfg.setApiKey("test-key");
+
+    const Runner = struct { ctx: config_cmd.Context };
+    const runConfig = struct {
+        pub fn call(r: *const Runner) !u8 {
+            return config_cmd.run(r.ctx);
+        }
+    }.call;
+
+    var args = [_][]const u8{ "set", "default_team_id", "ENG" };
+    var runner = Runner{ .ctx = .{
+        .allocator = allocator,
+        .io = test_io,
+        .config = &cfg,
+        .args = args[0..],
+        .json_output = false,
+        .config_path = config_path,
+        .retries = 0,
+        .timeout_ms = 10_000,
+    } };
+
+    const capture = try captureOutput(allocator, &runner, runConfig);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "could not verify team 'ENG'") != null);
+    // The real cause is named rather than being reported as a bad team.
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "request failed") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "not found in workspace") == null);
+    try std.testing.expectEqual(@as(usize, 0), cfg.default_team_id.len);
 }
 
 test "config command unsets state filter" {
@@ -2484,7 +2548,8 @@ test "labels list renders table with mock graphql" {
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expectEqualStrings(fixtures.labels_table, capture.stdout);
-    try std.testing.expectEqualStrings("", capture.stderr);
+    // Every paginating list command closes with the same summary line.
+    try std.testing.expectEqualStrings("labels list: fetched 3 items across 1 page\n", capture.stderr);
 }
 
 test "labels list prints json output with mock graphql" {
@@ -2599,7 +2664,7 @@ test "labels list plain output drops padding and truncation" {
     );
 }
 
-test "labels list warns when more labels remain" {
+test "labels list reports the resume cursor when more labels remain" {
     const allocator = std.testing.allocator;
     const truncated_payload =
         \\{
@@ -2631,10 +2696,13 @@ test "labels list warns when more labels remain" {
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expectEqualStrings("label-9\n", capture.stdout);
+    // The default page budget is one page, so the walk stops here and hands the
+    // caller the cursor to resume from instead of silently dropping the rest.
     try std.testing.expectEqualStrings(
-        "labels list: more labels available; pagination not implemented (endCursor cursor-label-9)\n",
+        "labels list: fetched 1 items across 1 page; more available, resume with --cursor cursor-label-9\n",
         capture.stderr,
     );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
 }
 
 test "labels list rejects invalid fields" {
@@ -2733,6 +2801,151 @@ test "parse labels list rejects bad limit and unknown flags" {
     try std.testing.expectError(error.MissingValue, labels_cmd.parseOptions(missing[0..]));
 }
 
+/// One label per page so a two-entry sequence exercises a real cursor hand-off.
+const labels_page1 =
+    \\{
+    \\  "data": {
+    \\    "issueLabels": {
+    \\      "nodes": [ { "id": "label-1", "name": "bug", "color": "#eb5757", "description": null, "team": { "key": "ENG" } } ],
+    \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-label-1" }
+    \\    }
+    \\  }
+    \\}
+;
+const labels_page2 =
+    \\{
+    \\  "data": {
+    \\    "issueLabels": {
+    \\      "nodes": [ { "id": "label-2", "name": "feature", "color": "#26b5ce", "description": null, "team": { "key": "ENG" } } ],
+    \\      "pageInfo": { "hasNextPage": false, "endCursor": "cursor-label-2" }
+    \\    }
+    \\  }
+    \\}
+;
+
+test "labels list walks multiple pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.setSequence("IssueLabels", &.{ labels_page1, labels_page2 });
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--limit", "1", "--pages", "2", "--quiet" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runLabels);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // Rows from page one are still readable after page two was parsed, which is
+    // only true because both responses are kept alive to the end.
+    try std.testing.expectEqualStrings("label-1\nlabel-2\n", capture.stdout);
+    try std.testing.expectEqualStrings("labels list: fetched 2 items across 2 pages\n", capture.stderr);
+    try std.testing.expectEqual(@as(usize, 2), server.request_count);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-label-1\"") != null);
+}
+
+test "labels list truncates at max-items" {
+    const allocator = std.testing.allocator;
+    const two_on_a_page =
+        \\{
+        \\  "data": {
+        \\    "issueLabels": {
+        \\      "nodes": [
+        \\        { "id": "label-1", "name": "bug", "color": "#eb5757", "description": null, "team": { "key": "ENG" } },
+        \\        { "id": "label-2", "name": "feature", "color": "#26b5ce", "description": null, "team": { "key": "ENG" } }
+        \\      ],
+        \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-label-2" }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("IssueLabels", two_on_a_page);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    // --all would otherwise run to the end; --max-items still stops it mid-page.
+    var args = [_][]const u8{ "--limit", "2", "--max-items", "1", "--all", "--quiet" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runLabels);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("label-1\n", capture.stdout);
+    try std.testing.expectEqualStrings(
+        "labels list: fetched 1 items across 1 page; more available, resume with --cursor cursor-label-2\n" ++
+            "labels list: stopped after 1 items due to --max-items\n",
+        capture.stderr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+}
+
+test "labels list resumes from a cursor" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("IssueLabels", labels_page2);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--cursor", "cursor-label-1", "--limit", "1", "--quiet" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runLabels);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("label-2\n", capture.stdout);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-label-1\"") != null);
+}
+
+test "labels list rejects --all with --pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--all", "--pages", "2" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runLabels);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr, "labels list: ConflictingPageFlags\n"));
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+
+    const conflicting = [_][]const u8{ "--all", "--pages", "2" };
+    try std.testing.expectError(error.ConflictingPageFlags, labels_cmd.parseOptions(conflicting[0..]));
+}
+
 test "users list renders table with mock graphql" {
     const allocator = std.testing.allocator;
 
@@ -2755,7 +2968,7 @@ test "users list renders table with mock graphql" {
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expectEqualStrings(fixtures.users_table, capture.stdout);
-    try std.testing.expectEqualStrings("", capture.stderr);
+    try std.testing.expectEqualStrings("users list: fetched 3 items across 1 page\n", capture.stderr);
 }
 
 test "users list prints json output with mock graphql" {
@@ -2927,6 +3140,150 @@ test "parse users list options" {
     try std.testing.expectError(error.UnknownFlag, users_cmd.parseOptions(unknown[0..]));
 }
 
+/// One user per page so a two-entry sequence exercises a real cursor hand-off.
+const users_page1 =
+    \\{
+    \\  "data": {
+    \\    "users": {
+    \\      "nodes": [ { "id": "user-1", "name": "Ada Lovelace", "displayName": "ada", "email": "ada@example.com", "active": true } ],
+    \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-user-1" }
+    \\    }
+    \\  }
+    \\}
+;
+const users_page2 =
+    \\{
+    \\  "data": {
+    \\    "users": {
+    \\      "nodes": [ { "id": "user-2", "name": "Grace Hopper", "displayName": "grace", "email": "grace@example.com", "active": true } ],
+    \\      "pageInfo": { "hasNextPage": false, "endCursor": "cursor-user-2" }
+    \\    }
+    \\  }
+    \\}
+;
+
+test "users list walks multiple pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.setSequence("Users", &.{ users_page1, users_page2 });
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--limit", "1", "--pages", "2", "--quiet" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runUsers);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("user-1\nuser-2\n", capture.stdout);
+    try std.testing.expectEqualStrings("users list: fetched 2 items across 2 pages\n", capture.stderr);
+    try std.testing.expectEqual(@as(usize, 2), server.request_count);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-user-1\"") != null);
+    // The active-member filter survives the second request.
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"active\":{\"eq\":true}") != null);
+}
+
+test "users list truncates at max-items" {
+    const allocator = std.testing.allocator;
+    const two_on_a_page =
+        \\{
+        \\  "data": {
+        \\    "users": {
+        \\      "nodes": [
+        \\        { "id": "user-1", "name": "Ada Lovelace", "displayName": "ada", "email": "ada@example.com", "active": true },
+        \\        { "id": "user-2", "name": "Grace Hopper", "displayName": "grace", "email": "grace@example.com", "active": true }
+        \\      ],
+        \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-user-2" }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("Users", two_on_a_page);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--limit", "2", "--max-items", "1", "--all", "--quiet" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runUsers);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("user-1\n", capture.stdout);
+    try std.testing.expectEqualStrings(
+        "users list: fetched 1 items across 1 page; more available, resume with --cursor cursor-user-2\n" ++
+            "users list: stopped after 1 items due to --max-items\n",
+        capture.stderr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+}
+
+test "users list resumes from a cursor" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("Users", users_page2);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--cursor", "cursor-user-1", "--limit", "1", "--quiet" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runUsers);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("user-2\n", capture.stdout);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-user-1\"") != null);
+}
+
+test "users list rejects --all with --pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--all", "--pages", "2" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runUsers);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr, "users list: ConflictingPageFlags\n"));
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+
+    const conflicting = [_][]const u8{ "--all", "--pages", "2" };
+    try std.testing.expectError(error.ConflictingPageFlags, users_cmd.parseOptions(conflicting[0..]));
+}
+
 test "states list renders table with mock graphql" {
     const allocator = std.testing.allocator;
 
@@ -2947,7 +3304,7 @@ test "states list renders table with mock graphql" {
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expectEqualStrings(fixtures.states_table, capture.stdout);
-    try std.testing.expectEqualStrings("", capture.stderr);
+    try std.testing.expectEqualStrings("states list: fetched 4 items across 1 page\n", capture.stderr);
 }
 
 test "states list prints json output with mock graphql" {
@@ -3051,7 +3408,7 @@ test "states list renders team column for states from several teams" {
             "state-des-3  In Progress  started  2         DES \n",
         capture.stdout,
     );
-    try std.testing.expectEqualStrings("", capture.stderr);
+    try std.testing.expectEqualStrings("states list: fetched 2 items across 1 page\n", capture.stderr);
 
     // The team key only arrives if the selection set asks for it.
     const recorded = server.lastRequest() orelse return error.TestExpectedResult;
@@ -3189,6 +3546,148 @@ test "parse states list options" {
 
     const positional = [_][]const u8{"ENG"};
     try std.testing.expectError(error.UnexpectedArgument, states_cmd.parseOptions(positional[0..]));
+}
+
+/// One state per page so a two-entry sequence exercises a real cursor hand-off.
+const states_page1 =
+    \\{
+    \\  "data": {
+    \\    "workflowStates": {
+    \\      "nodes": [ { "id": "state-1", "name": "Backlog", "type": "backlog", "position": 0, "team": { "key": "ENG" } } ],
+    \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-state-1" }
+    \\    }
+    \\  }
+    \\}
+;
+const states_page2 =
+    \\{
+    \\  "data": {
+    \\    "workflowStates": {
+    \\      "nodes": [ { "id": "state-2", "name": "Todo", "type": "unstarted", "position": 1, "team": { "key": "ENG" } } ],
+    \\      "pageInfo": { "hasNextPage": false, "endCursor": "cursor-state-2" }
+    \\    }
+    \\  }
+    \\}
+;
+
+test "states list walks multiple pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.setSequence("WorkflowStates", &.{ states_page1, states_page2 });
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--limit", "1", "--pages", "2", "--quiet" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runStates);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("state-1\nstate-2\n", capture.stdout);
+    try std.testing.expectEqualStrings("states list: fetched 2 items across 2 pages\n", capture.stderr);
+    try std.testing.expectEqual(@as(usize, 2), server.request_count);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-state-1\"") != null);
+}
+
+test "states list truncates at max-items" {
+    const allocator = std.testing.allocator;
+    const two_on_a_page =
+        \\{
+        \\  "data": {
+        \\    "workflowStates": {
+        \\      "nodes": [
+        \\        { "id": "state-1", "name": "Backlog", "type": "backlog", "position": 0, "team": { "key": "ENG" } },
+        \\        { "id": "state-2", "name": "Todo", "type": "unstarted", "position": 1, "team": { "key": "ENG" } }
+        \\      ],
+        \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-state-2" }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("WorkflowStates", two_on_a_page);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--limit", "2", "--max-items", "1", "--all", "--quiet" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runStates);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("state-1\n", capture.stdout);
+    try std.testing.expectEqualStrings(
+        "states list: fetched 1 items across 1 page; more available, resume with --cursor cursor-state-2\n" ++
+            "states list: stopped after 1 items due to --max-items\n",
+        capture.stderr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+}
+
+test "states list resumes from a cursor" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("WorkflowStates", states_page2);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--cursor", "cursor-state-1", "--limit", "1", "--quiet" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runStates);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("state-2\n", capture.stdout);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-state-1\"") != null);
+}
+
+test "states list rejects --all with --pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--all", "--pages", "2" };
+    const runner = EnumRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runStates);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr, "states list: ConflictingPageFlags\n"));
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+
+    const conflicting = [_][]const u8{ "--all", "--pages", "2" };
+    try std.testing.expectError(error.ConflictingPageFlags, states_cmd.parseOptions(conflicting[0..]));
 }
 
 test "me prints viewer table with mock graphql" {
@@ -3494,6 +3993,75 @@ test "issue delete requires target" {
 
     try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "missing identifier") != null);
+}
+
+test "issue delete rejects --reason" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("IssueDelete", fixtures.issue_delete_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    // `issueDelete` accepts `(id, permanentlyDelete)` and nothing else, so a
+    // reason could never have reached Linear. It was echoed back into this
+    // CLI's own output, which read exactly like an audit trail that existed.
+    // Removed outright rather than deprecated, the way `--api-key` was.
+    const forms = [_][]const []const u8{
+        &.{ "LIN-300", "--yes", "--reason", "duplicate" },
+        &.{ "LIN-300", "--yes", "--reason=duplicate" },
+    };
+
+    for (forms) |form| {
+        const Runner = struct {
+            allocator: std.mem.Allocator,
+            cfg: *config.Config,
+            args: []const []const u8,
+        };
+        const runDelete = struct {
+            pub fn call(r: *const Runner) !u8 {
+                const args = try r.allocator.alloc([]const u8, r.args.len);
+                defer r.allocator.free(args);
+                for (r.args, 0..) |arg, idx| args[idx] = arg;
+                return issue_delete_cmd.run(.{
+                    .allocator = r.allocator,
+                    .io = test_io,
+                    .config = r.cfg,
+                    .args = args,
+                    .retries = 0,
+                    .timeout_ms = 10_000,
+                    .json_output = false,
+                });
+            }
+        }.call;
+        const runner = Runner{ .allocator = allocator, .cfg = &cfg, .args = form };
+
+        const capture = try captureOutput(allocator, &runner, runDelete);
+        defer capture.deinit(allocator);
+
+        try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "UnknownFlag") != null);
+        try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "--reason") == null);
+        try std.testing.expectEqualStrings("", capture.stdout);
+    }
+
+    // Rejected during flag parsing, so no mutation was ever attempted.
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+}
+
+test "issue delete usage no longer advertises --reason" {
+    const allocator = std.testing.allocator;
+
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer buffer.deinit();
+    try issue_delete_cmd.usage(&buffer.writer);
+
+    try std.testing.expect(std.mem.indexOf(u8, buffer.written(), "--reason") == null);
+    try std.testing.expect(std.mem.indexOf(u8, buffer.written(), "--dry-run") != null);
 }
 
 test "issue delete dry run validates without mutation" {
@@ -4915,7 +5483,7 @@ test "project create requires confirmation" {
     try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "confirmation required") != null);
 }
 
-test "projects list renders rows and warns about pagination" {
+test "projects list renders rows and reports the resume cursor" {
     const allocator = std.testing.allocator;
 
     var server = mock_graphql.MockServer.init(allocator);
@@ -4953,7 +5521,10 @@ test "projects list renders rows and warns about pagination" {
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "Roadmap") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "API revamp") != null);
-    try std.testing.expectEqualStrings("projects list: more projects available; pagination not implemented (endCursor cursor-123)\n", capture.stderr);
+    try std.testing.expectEqualStrings(
+        "projects list: fetched 2 items across 1 page; more available, resume with --cursor cursor-123\n",
+        capture.stderr,
+    );
 }
 
 test "projects list maps state filter to status id" {
@@ -5070,6 +5641,157 @@ test "projects list maps team filter to accessibleTeams some filter" {
     if (eq_value != .string) return error.TestExpectedResult;
     try std.testing.expectEqualStrings("ENG", eq_value.string);
     try std.testing.expect(filter.object.get("team") == null);
+}
+
+/// `projects list` has no `--quiet`, so its pagination cases project down to the
+/// id column and assert the rendered table instead.
+const ProjectsRunner = struct {
+    allocator: std.mem.Allocator,
+    cfg: *config.Config,
+    args: [][]const u8,
+    json_output: bool = false,
+};
+
+fn runProjectsList(r: *const ProjectsRunner) !u8 {
+    return projects_cmd.run(.{
+        .allocator = r.allocator,
+        .io = test_io,
+        .config = r.cfg,
+        .args = r.args,
+        .retries = 0,
+        .timeout_ms = 10_000,
+        .json_output = r.json_output,
+    });
+}
+
+/// One project per page so a two-entry sequence exercises a real cursor hand-off.
+const projects_page1 =
+    \\{
+    \\  "data": {
+    \\    "projects": {
+    \\      "nodes": [ { "id": "proj_1", "name": "Roadmap", "slugId": "roadmap", "description": null,
+    \\                   "state": "started", "startDate": null, "targetDate": null, "url": "https://linear.app/roadmap" } ],
+    \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-proj-1" }
+    \\    }
+    \\  }
+    \\}
+;
+const projects_page2 =
+    \\{
+    \\  "data": {
+    \\    "projects": {
+    \\      "nodes": [ { "id": "proj_2", "name": "API revamp", "slugId": "api", "description": null,
+    \\                   "state": "planned", "startDate": null, "targetDate": null, "url": "https://linear.app/api" } ],
+    \\      "pageInfo": { "hasNextPage": false, "endCursor": "cursor-proj-2" }
+    \\    }
+    \\  }
+    \\}
+;
+
+test "projects list walks multiple pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.setSequence("Projects", &.{ projects_page1, projects_page2 });
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--limit", "1", "--pages", "2", "--fields", "id" };
+    const runner = ProjectsRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runProjectsList);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // Page one's row is still intact after page two was parsed.
+    try std.testing.expectEqualStrings("ID    \nproj_1\nproj_2\n", capture.stdout);
+    try std.testing.expectEqualStrings("projects list: fetched 2 items across 2 pages\n", capture.stderr);
+    try std.testing.expectEqual(@as(usize, 2), server.request_count);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-proj-1\"") != null);
+}
+
+test "projects list truncates at max-items" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    // The stock fixture has two nodes and hasNextPage true.
+    try server.set("Projects", fixtures.projects_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--limit", "2", "--max-items", "1", "--all", "--fields", "id" };
+    const runner = ProjectsRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runProjectsList);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("ID      \nproj_123\n", capture.stdout);
+    try std.testing.expectEqualStrings(
+        "projects list: fetched 1 items across 1 page; more available, resume with --cursor cursor-123\n" ++
+            "projects list: stopped after 1 items due to --max-items\n",
+        capture.stderr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+}
+
+test "projects list resumes from a cursor" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("Projects", projects_page2);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--cursor", "cursor-proj-1", "--limit", "1", "--fields", "id" };
+    const runner = ProjectsRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runProjectsList);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("ID    \nproj_2\n", capture.stdout);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-proj-1\"") != null);
+}
+
+test "projects list rejects --all with --pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "--all", "--pages", "2" };
+    const runner = ProjectsRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runProjectsList);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr, "projects list: ConflictingPageFlags\n"));
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
 }
 
 test "project view prints teams and truncated issues warning" {
@@ -8912,18 +9634,118 @@ test "milestone list renders table with mock graphql" {
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expectEqualStrings(fixtures.milestones_table, capture.stdout);
-    try std.testing.expectEqualStrings("", capture.stderr);
+    try std.testing.expectEqualStrings("milestone list: fetched 3 items across 1 page\n", capture.stderr);
     // A uuid needs no project lookup.
     try std.testing.expectEqual(@as(usize, 1), server.request_count);
+
+    // Scoped and unscoped listings share the root query; --project only filters.
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, recorded.query, "projectMilestones(first: $first") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorded.query, "project { id name }") != null);
 }
 
-test "milestone list requires a project" {
+test "milestone list applies the project filter to the root query" {
     const allocator = std.testing.allocator;
 
     var server = mock_graphql.MockServer.init(allocator);
     defer server.deinit();
     var scope = mock_graphql.useServer(&server);
     defer scope.restore();
+    try server.set("ProjectMilestones", fixtures.milestones_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "--project", milestone_project_uuid, "--quiet" };
+    const runner = MilestoneRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runMilestone);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    try std.testing.expectEqualStrings("ProjectMilestones", recorded.operation);
+    const vars_json = recorded.variables_json orelse return error.TestExpectedResult;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, vars_json, .{});
+    defer parsed.deinit();
+    const vars = parsed.value;
+    if (vars != .object) return error.TestExpectedResult;
+
+    // filter: { project: { id: { eq: <uuid> } } }
+    const filter = vars.object.get("filter") orelse return error.TestExpectedResult;
+    if (filter != .object) return error.TestExpectedResult;
+    const project_filter = filter.object.get("project") orelse return error.TestExpectedResult;
+    if (project_filter != .object) return error.TestExpectedResult;
+    const id_filter = project_filter.object.get("id") orelse return error.TestExpectedResult;
+    if (id_filter != .object) return error.TestExpectedResult;
+    const eq_value = id_filter.object.get("eq") orelse return error.TestExpectedResult;
+    if (eq_value != .string) return error.TestExpectedResult;
+    try std.testing.expectEqualStrings(milestone_project_uuid, eq_value.string);
+    // The old shape passed the project as a top-level `id` variable.
+    try std.testing.expect(vars.object.get("id") == null);
+}
+
+test "milestone list without a project sends no filter" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("ProjectMilestones", fixtures.milestones_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "--quiet" };
+    const runner = MilestoneRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runMilestone);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("ms-1\nms-2\nms-3\n", capture.stdout);
+    // No project to resolve, so the listing costs exactly one request.
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars_json = recorded.variables_json orelse return error.TestExpectedResult;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, vars_json, .{});
+    defer parsed.deinit();
+    const vars = parsed.value;
+    if (vars != .object) return error.TestExpectedResult;
+    try std.testing.expect(vars.object.get("filter") == null);
+}
+
+test "milestone list disambiguates milestones from several projects" {
+    const allocator = std.testing.allocator;
+
+    // Without --project the query spans every project, so two milestones are
+    // only distinguishable by the project column.
+    const cross_project_payload =
+        \\{
+        \\  "data": {
+        \\    "projectMilestones": {
+        \\      "nodes": [
+        \\        { "id": "ms-1", "name": "Alpha", "description": null, "targetDate": "2026-08-15", "sortOrder": 1,
+        \\          "project": { "id": "project-1", "name": "Roadmap" } },
+        \\        { "id": "ms-9", "name": "Hardening", "description": null, "targetDate": "2026-11-01", "sortOrder": 2,
+        \\          "project": { "id": "project-2", "name": "Platform" } },
+        \\        { "id": "ms-7", "name": "Cutover", "description": null, "targetDate": null, "sortOrder": 3,
+        \\          "project": { "id": "project-3", "name": "Migration" } }
+        \\      ],
+        \\      "pageInfo": { "hasNextPage": false, "endCursor": "cursor-ms-7" }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("ProjectMilestones", cross_project_payload);
 
     var cfg = try makeTestConfig(allocator);
     defer cfg.deinit();
@@ -8934,9 +9756,72 @@ test "milestone list requires a project" {
     const capture = try captureOutput(allocator, &runner, runMilestone);
     defer capture.deinit(allocator);
 
-    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
-    try std.testing.expectEqualStrings("milestone list: --project is required\n", capture.stderr);
-    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings(
+        "ID    Name       Target      Sort  Project  \n" ++
+            "ms-1  Alpha      2026-08-15  1     Roadmap  \n" ++
+            "ms-9  Hardening  2026-11-01  2     Platform \n" ++
+            "ms-7  Cutover                3     Migration\n",
+        capture.stdout,
+    );
+    try std.testing.expectEqualStrings("milestone list: fetched 3 items across 1 page\n", capture.stderr);
+}
+
+test "milestone list keeps the project column when fields ask for it" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("ProjectMilestones", fixtures.milestones_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "--fields", "name,project" };
+    const runner = MilestoneRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runMilestone);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings(
+        "Name   Project\n" ++
+            "Alpha  Roadmap\n" ++
+            "Beta   Roadmap\n" ++
+            "GA     Roadmap\n",
+        capture.stdout,
+    );
+}
+
+test "milestone list drops the project column when fields exclude it" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("ProjectMilestones", fixtures.milestones_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "--fields", "id,name" };
+    const runner = MilestoneRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runMilestone);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings(
+        "ID    Name \n" ++
+            "ms-1  Alpha\n" ++
+            "ms-2  Beta \n" ++
+            "ms-3  GA   \n",
+        capture.stdout,
+    );
+    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "Project") == null);
 }
 
 test "milestone list resolves a project name to an id" {
@@ -8965,7 +9850,8 @@ test "milestone list resolves a project name to an id" {
     const recorded = server.lastRequest() orelse return error.TestExpectedResult;
     try std.testing.expectEqualStrings("ProjectMilestones", recorded.operation);
     const vars = recorded.variables_json orelse return error.TestExpectedResult;
-    try std.testing.expect(std.mem.indexOf(u8, vars, "\"id\":\"project-1\"") != null);
+    // The resolved uuid lands in the filter, not in a top-level `id` variable.
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"project\":{\"id\":{\"eq\":\"project-1\"}}") != null);
 }
 
 test "milestone list rejects an ambiguous project name" {
@@ -9053,10 +9939,12 @@ test "milestone list prints json output with mock graphql" {
 
     var parsed = try std.json.parseFromSlice(std.json.Value, allocator, capture.stdout, .{});
     defer parsed.deinit();
-    const project = parsed.value.object.get("project") orelse return error.TestExpectedResult;
-    const milestones = project.object.get("projectMilestones") orelse return error.TestExpectedResult;
+    const milestones = parsed.value.object.get("projectMilestones") orelse return error.TestExpectedResult;
     const nodes = milestones.object.get("nodes") orelse return error.TestExpectedResult;
     try std.testing.expectEqual(@as(usize, 3), nodes.array.items.len);
+    const page_info = milestones.object.get("pageInfo") orelse return error.TestExpectedResult;
+    const has_next = page_info.object.get("hasNextPage") orelse return error.TestExpectedResult;
+    try std.testing.expect(!has_next.bool);
 }
 
 test "milestone list rejects invalid fields" {
@@ -9082,18 +9970,15 @@ test "milestone list rejects invalid fields" {
     try std.testing.expectEqual(@as(usize, 0), server.request_count);
 }
 
-test "milestone list warns when more milestones remain" {
+test "milestone list reports the resume cursor when more milestones remain" {
     const allocator = std.testing.allocator;
     const more_pages =
         \\{
         \\  "data": {
-        \\    "project": {
-        \\      "id": "project-1",
-        \\      "name": "Roadmap",
-        \\      "projectMilestones": {
-        \\        "nodes": [ { "id": "ms-1", "name": "Alpha", "targetDate": "2026-08-15", "sortOrder": 1 } ],
-        \\        "pageInfo": { "hasNextPage": true, "endCursor": "cursor-ms-1" }
-        \\      }
+        \\    "projectMilestones": {
+        \\      "nodes": [ { "id": "ms-1", "name": "Alpha", "targetDate": "2026-08-15", "sortOrder": 1,
+        \\                   "project": { "id": "project-1", "name": "Roadmap" } } ],
+        \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-ms-1" }
         \\    }
         \\  }
         \\}
@@ -9117,9 +10002,159 @@ test "milestone list warns when more milestones remain" {
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expectEqualStrings("ms-1\n", capture.stdout);
     try std.testing.expectEqualStrings(
-        "milestone list: more milestones available; pagination not implemented (endCursor cursor-ms-1)\n",
+        "milestone list: fetched 1 items across 1 page; more available, resume with --cursor cursor-ms-1\n",
         capture.stderr,
     );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+}
+
+/// One milestone per page so a two-entry sequence exercises a real cursor
+/// hand-off; the pages come from different projects so the walk also proves the
+/// project column survives page boundaries.
+const milestones_page1 =
+    \\{
+    \\  "data": {
+    \\    "projectMilestones": {
+    \\      "nodes": [ { "id": "ms-1", "name": "Alpha", "description": null, "targetDate": "2026-08-15", "sortOrder": 1,
+    \\                   "project": { "id": "project-1", "name": "Roadmap" } } ],
+    \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-ms-1" }
+    \\    }
+    \\  }
+    \\}
+;
+const milestones_page2 =
+    \\{
+    \\  "data": {
+    \\    "projectMilestones": {
+    \\      "nodes": [ { "id": "ms-9", "name": "Hardening", "description": null, "targetDate": "2026-11-01", "sortOrder": 2,
+    \\                   "project": { "id": "project-2", "name": "Platform" } } ],
+    \\      "pageInfo": { "hasNextPage": false, "endCursor": "cursor-ms-9" }
+    \\    }
+    \\  }
+    \\}
+;
+
+test "milestone list walks multiple pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.setSequence("ProjectMilestones", &.{ milestones_page1, milestones_page2 });
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "--limit", "1", "--pages", "2", "--fields", "id,project", "--data-only" };
+    const runner = MilestoneRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runMilestone);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // Page one's borrowed project name is still readable after page two parsed.
+    try std.testing.expectEqualStrings("ms-1\tRoadmap\nms-9\tPlatform\n", capture.stdout);
+    try std.testing.expectEqualStrings("milestone list: fetched 2 items across 2 pages\n", capture.stderr);
+    try std.testing.expectEqual(@as(usize, 2), server.request_count);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-ms-1\"") != null);
+}
+
+test "milestone list truncates at max-items" {
+    const allocator = std.testing.allocator;
+    const two_on_a_page =
+        \\{
+        \\  "data": {
+        \\    "projectMilestones": {
+        \\      "nodes": [
+        \\        { "id": "ms-1", "name": "Alpha", "description": null, "targetDate": null, "sortOrder": 1,
+        \\          "project": { "id": "project-1", "name": "Roadmap" } },
+        \\        { "id": "ms-9", "name": "Hardening", "description": null, "targetDate": null, "sortOrder": 2,
+        \\          "project": { "id": "project-2", "name": "Platform" } }
+        \\      ],
+        \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-ms-9" }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("ProjectMilestones", two_on_a_page);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "--limit", "2", "--max-items", "1", "--all", "--quiet" };
+    const runner = MilestoneRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runMilestone);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("ms-1\n", capture.stdout);
+    try std.testing.expectEqualStrings(
+        "milestone list: fetched 1 items across 1 page; more available, resume with --cursor cursor-ms-9\n" ++
+            "milestone list: stopped after 1 items due to --max-items\n",
+        capture.stderr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+}
+
+test "milestone list resumes from a cursor" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("ProjectMilestones", milestones_page2);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "--cursor", "cursor-ms-1", "--limit", "1", "--quiet" };
+    const runner = MilestoneRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runMilestone);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("ms-9\n", capture.stdout);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-ms-1\"") != null);
+}
+
+test "milestone list rejects --all with --pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "--all", "--pages", "2" };
+    const runner = MilestoneRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runMilestone);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr, "milestone list: ConflictingPageFlags\n"));
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+
+    const conflicting = [_][]const u8{ "--all", "--pages", "2" };
+    try std.testing.expectError(error.ConflictingPageFlags, milestones_cmd.parseListOptions(conflicting[0..]));
 }
 
 test "milestone view prints key values" {
@@ -9607,16 +10642,34 @@ test "milestone rejects an unknown subcommand" {
 }
 
 test "parse milestone list options" {
-    const args = [_][]const u8{ "--project=Roadmap", "--limit", "10", "--fields", "id,name", "--quiet", "--plain" };
+    const args = [_][]const u8{
+        "--project=Roadmap", "--limit",    "10",      "--max-items", "40",
+        "--cursor",          "cursor-abc", "--pages", "3",           "--fields",
+        "id,name",           "--quiet",    "--plain",
+    };
     const opts = try milestones_cmd.parseListOptions(args[0..]);
     try std.testing.expectEqualStrings("Roadmap", opts.project.?);
     try std.testing.expectEqual(@as(usize, 10), opts.limit);
+    try std.testing.expectEqual(@as(usize, 40), opts.max_items.?);
+    try std.testing.expectEqualStrings("cursor-abc", opts.cursor.?);
+    try std.testing.expectEqual(@as(usize, 3), opts.pages.?);
+    try std.testing.expect(!opts.all);
     try std.testing.expectEqualStrings("id,name", opts.fields.?);
     try std.testing.expect(opts.quiet);
     try std.testing.expect(opts.plain);
 
+    // --project is optional now: an argument-free list is a workspace-wide one.
+    const bare = [_][]const u8{};
+    const bare_opts = try milestones_cmd.parseListOptions(bare[0..]);
+    try std.testing.expect(bare_opts.project == null);
+    try std.testing.expectEqual(@as(usize, 50), bare_opts.limit);
+    try std.testing.expectEqual(@as(?usize, null), bare_opts.pages);
+
     const bad_limit = [_][]const u8{ "--limit", "0" };
     try std.testing.expectError(error.InvalidLimit, milestones_cmd.parseListOptions(bad_limit[0..]));
+
+    const bad_pages = [_][]const u8{ "--pages", "0" };
+    try std.testing.expectError(error.InvalidPageCount, milestones_cmd.parseListOptions(bad_pages[0..]));
 
     const unknown = [_][]const u8{"--nope"};
     try std.testing.expectError(error.UnknownFlag, milestones_cmd.parseListOptions(unknown[0..]));
@@ -11123,6 +12176,415 @@ test "config load rejects a config file with a malformed credential_helper" {
     );
 }
 
+test "credentialHelperErrorText covers every credential_helper rejection" {
+    // `main.zig` prints this for a malformed helper in the config file, so a
+    // variant with no sentence here would surface as a bare Zig error name.
+    const cases = [_]config.CredentialHelperError{
+        config.CredentialHelperError.EmptyCredentialHelper,
+        config.CredentialHelperError.TooManyCredentialHelperArgs,
+        config.CredentialHelperError.InvalidCredentialHelperArg,
+        config.CredentialHelperError.InvalidCredentialHelper,
+    };
+
+    for (cases, 0..) |err, idx| {
+        const text = config.credentialHelperErrorText(err);
+        try std.testing.expect(text.len > 0);
+        // The message must not just restate the error name.
+        try std.testing.expect(std.mem.indexOf(u8, text, "credential_helper") != null);
+        try std.testing.expect(std.mem.indexOf(u8, text, @errorName(err)) == null);
+        for (cases[idx + 1 ..]) |other| {
+            try std.testing.expect(!std.mem.eql(u8, text, config.credentialHelperErrorText(other)));
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// config set credential_helper
+//
+// Bootstrapping a helper must not require the key to be written to disk first.
+// The old route was `auth set` (plaintext on disk) -> `auth migrate` -> rotate,
+// which defeats the backend's whole premise. What made `config set` unsafe was
+// the missing verification, so the helper is run here before it is stored: a
+// stored-but-broken helper *clears* the effective key instead of falling
+// through, and would lock the operator out of their own credential.
+// ---------------------------------------------------------------------------
+
+const ConfigRunner = struct {
+    allocator: std.mem.Allocator,
+    cfg: *config.Config,
+    args: []const []const u8,
+    config_path: ?[]const u8 = null,
+    json_output: bool = false,
+    /// `null` keeps the command inert: nothing spawns unless a test installs a
+    /// fake, and no test here ever runs a real `op`.
+    credential_runner: ?git.Runner = null,
+};
+
+fn runConfigCommand(r: *const ConfigRunner) !u8 {
+    const args = try r.allocator.alloc([]const u8, r.args.len);
+    defer r.allocator.free(args);
+    for (r.args, 0..) |arg, idx| args[idx] = arg;
+
+    return config_cmd.run(.{
+        .allocator = r.allocator,
+        .io = test_io,
+        .config = r.cfg,
+        .args = args,
+        .json_output = r.json_output,
+        .config_path = r.config_path,
+        .retries = 0,
+        .timeout_ms = 10_000,
+        .credential_runner = r.credential_runner,
+    });
+}
+
+/// A config file holding nothing but defaults — no key anywhere, which is the
+/// state an operator who never wants the key on disk starts from.
+const HelperConfigFixture = struct {
+    tmp: std.testing.TmpDir,
+    /// `realPathFileAlloc` returns a sentinel-terminated slice; keeping the
+    /// sentinel in the type is what makes the matching `free` the right size.
+    dir_path: [:0]u8,
+    config_path: []u8,
+    cfg: config.Config,
+    saved_key_env: ?[]u8,
+    saved_config_env: ?[]u8,
+    allocator: std.mem.Allocator,
+
+    fn deinit(self: *HelperConfigFixture) void {
+        self.cfg.deinit();
+        self.allocator.free(self.config_path);
+        self.allocator.free(self.dir_path);
+        self.tmp.cleanup();
+        restoreEnv(env_name_z, self.saved_key_env, self.allocator);
+        restoreEnv(config_env_name_z, self.saved_config_env, self.allocator);
+    }
+
+    fn readConfig(self: *HelperConfigFixture) ![]u8 {
+        return self.tmp.dir.readFileAlloc(test_io, "config.json", self.allocator, .limited(64 * 1024));
+    }
+};
+
+fn makeHelperConfigFixture(allocator: std.mem.Allocator) !HelperConfigFixture {
+    const saved_key_env = testEnviron().getAlloc(allocator, env_name) catch null;
+    const saved_config_env = testEnviron().getAlloc(allocator, config_env_name) catch null;
+    clearEnv();
+
+    var tmp = std.testing.tmpDir(.{});
+    errdefer tmp.cleanup();
+    const dir_path = try tmp.dir.realPathFileAlloc(test_io, ".", allocator);
+    errdefer allocator.free(dir_path);
+    const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
+    errdefer allocator.free(config_path);
+
+    var cfg = try config.load(allocator, test_io, testEnviron(), config_path);
+    errdefer cfg.deinit();
+    try cfg.save(allocator, config_path);
+
+    return .{
+        .tmp = tmp,
+        .dir_path = dir_path,
+        .config_path = config_path,
+        .cfg = cfg,
+        .saved_key_env = saved_key_env,
+        .saved_config_env = saved_config_env,
+        .allocator = allocator,
+    };
+}
+
+test "config set credential_helper stores a helper that returns a usable key" {
+    const allocator = std.testing.allocator;
+
+    var fixture = try makeHelperConfigFixture(allocator);
+    defer fixture.deinit();
+
+    var fake = FakeProcess{
+        .allocator = allocator,
+        .script = &.{.{ .stdout = fake_helper_key ++ "\n" }},
+    };
+    defer fake.deinit();
+
+    const runner = ConfigRunner{
+        .allocator = allocator,
+        .cfg = &fixture.cfg,
+        .args = &.{ "set", "credential_helper", "op read op://Private/Linear/api-key" },
+        .config_path = fixture.config_path,
+        .credential_runner = fake.runner(),
+    };
+    const capture = try captureOutput(allocator, &runner, runConfigCommand);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "credential_helper saved") != null);
+
+    // The helper was actually run, with the whitespace split as argv.
+    try expectCall(&fake, 0, &.{ "op", "read", "op://Private/Linear/api-key" });
+
+    // The key it produced decided whether to save and went nowhere else.
+    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, fake_helper_key) == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, fake_helper_key) == null);
+
+    const argv = fixture.cfg.credential_helper.?;
+    try std.testing.expectEqual(@as(usize, 3), argv.len);
+    try std.testing.expectEqualStrings("op", argv[0]);
+    try std.testing.expectEqualStrings("op://Private/Linear/api-key", argv[2]);
+
+    const written = try fixture.readConfig();
+    defer allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "credential_helper") != null);
+    // The point of the backend: the key itself never reaches the file.
+    try std.testing.expect(std.mem.indexOf(u8, written, fake_helper_key) == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, "\"api_key\"") == null);
+
+    var reloaded = try config.load(allocator, test_io, testEnviron(), fixture.config_path);
+    defer reloaded.deinit();
+    const persisted = reloaded.credential_helper.?;
+    try std.testing.expectEqual(@as(usize, 3), persisted.len);
+    try std.testing.expectEqualStrings("read", persisted[1]);
+}
+
+test "config set credential_helper splits with no shell semantics" {
+    const allocator = std.testing.allocator;
+
+    var fixture = try makeHelperConfigFixture(allocator);
+    defer fixture.deinit();
+
+    var fake = FakeProcess{
+        .allocator = allocator,
+        .script = &.{.{ .stdout = fake_helper_key ++ "\n" }},
+    };
+    defer fake.deinit();
+
+    const runner = ConfigRunner{
+        .allocator = allocator,
+        .cfg = &fixture.cfg,
+        .args = &.{ "set", "credential_helper", "sh -c 'echo hi' > /tmp/x" },
+        .config_path = fixture.config_path,
+        .credential_runner = fake.runner(),
+    };
+    const capture = try captureOutput(allocator, &runner, runConfigCommand);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // Identical to what the config file's bare-string form produces: quotes and
+    // the redirection are ordinary bytes in argv elements, not syntax. No shell
+    // is spawned, so nothing here redirects, expands, or pipes.
+    try expectCall(&fake, 0, &.{ "sh", "-c", "'echo", "hi'", ">", "/tmp/x" });
+    try std.testing.expectEqual(@as(usize, 6), fixture.cfg.credential_helper.?.len);
+}
+
+test "config set credential_helper refuses a helper that fails" {
+    const allocator = std.testing.allocator;
+
+    var fixture = try makeHelperConfigFixture(allocator);
+    defer fixture.deinit();
+
+    var fake = FakeProcess{
+        .allocator = allocator,
+        .script = &.{.{ .exit_code = 1, .stderr = "vault is locked\n" }},
+    };
+    defer fake.deinit();
+
+    const runner = ConfigRunner{
+        .allocator = allocator,
+        .cfg = &fixture.cfg,
+        .args = &.{ "set", "credential_helper", "op read op://Private/Linear/api-key" },
+        .config_path = fixture.config_path,
+        .credential_runner = fake.runner(),
+    };
+    const capture = try captureOutput(allocator, &runner, runConfigCommand);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "exited 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "vault is locked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "was not saved") != null);
+    try std.testing.expectEqualStrings("", capture.stdout);
+
+    // Nothing stored: a saved-but-broken helper clears the effective key rather
+    // than falling through, so it would lock the operator out.
+    try std.testing.expect(fixture.cfg.credential_helper == null);
+    const written = try fixture.readConfig();
+    defer allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "credential_helper") == null);
+}
+
+test "config set credential_helper refuses a helper that produces nothing usable" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct {
+        step: FakeProcess.Step,
+        expected: []const u8,
+    }{
+        // Exit 0 with empty stdout is a failure, not an empty store.
+        .{ .step = .{ .stdout = "" }, .expected = "produced no output" },
+        // Output that could never be sent as an Authorization header.
+        .{ .step = .{ .stdout = "not a key!\n" }, .expected = "not a valid API key" },
+        // The binary is not there at all.
+        .{ .step = .{ .fail = git.Error.BinaryNotFound }, .expected = "was not found on PATH" },
+    };
+
+    for (cases) |case| {
+        var fixture = try makeHelperConfigFixture(allocator);
+        defer fixture.deinit();
+
+        var script = [_]FakeProcess.Step{case.step};
+        var fake = FakeProcess{ .allocator = allocator, .script = script[0..] };
+        defer fake.deinit();
+
+        const runner = ConfigRunner{
+            .allocator = allocator,
+            .cfg = &fixture.cfg,
+            .args = &.{ "set", "credential_helper", "op read op://Private/Linear/api-key" },
+            .config_path = fixture.config_path,
+            .credential_runner = fake.runner(),
+        };
+        const capture = try captureOutput(allocator, &runner, runConfigCommand);
+        defer capture.deinit(allocator);
+
+        try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, capture.stderr, case.expected) != null);
+        try std.testing.expect(fixture.cfg.credential_helper == null);
+
+        const written = try fixture.readConfig();
+        defer allocator.free(written);
+        try std.testing.expect(std.mem.indexOf(u8, written, "credential_helper") == null);
+    }
+}
+
+test "config set credential_helper enforces the argv bounds before spawning" {
+    const allocator = std.testing.allocator;
+
+    var fixture = try makeHelperConfigFixture(allocator);
+    defer fixture.deinit();
+
+    var fake = FakeProcess{ .allocator = allocator, .script = &.{} };
+    defer fake.deinit();
+
+    // One past `max_credential_helper_args`.
+    const too_many = "a b c d e f g h i j k l m n o p q";
+    const runner = ConfigRunner{
+        .allocator = allocator,
+        .cfg = &fixture.cfg,
+        .args = &.{ "set", "credential_helper", too_many },
+        .config_path = fixture.config_path,
+        .credential_runner = fake.runner(),
+    };
+    const capture = try captureOutput(allocator, &runner, runConfigCommand);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "too many arguments") != null);
+    // An argv that could never be stored is never handed to a process.
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+    try std.testing.expect(fixture.cfg.credential_helper == null);
+}
+
+test "config set credential_helper refuses an over-long argument before spawning" {
+    const allocator = std.testing.allocator;
+
+    var fixture = try makeHelperConfigFixture(allocator);
+    defer fixture.deinit();
+
+    var fake = FakeProcess{ .allocator = allocator, .script = &.{} };
+    defer fake.deinit();
+
+    const long_arg = try allocator.alloc(u8, config.max_credential_helper_arg_len + 1);
+    defer allocator.free(long_arg);
+    @memset(long_arg, 'x');
+    const value = try std.fmt.allocPrint(allocator, "op {s}", .{long_arg});
+    defer allocator.free(value);
+
+    const runner = ConfigRunner{
+        .allocator = allocator,
+        .cfg = &fixture.cfg,
+        .args = &.{ "set", "credential_helper", value },
+        .config_path = fixture.config_path,
+        .credential_runner = fake.runner(),
+    };
+    const capture = try captureOutput(allocator, &runner, runConfigCommand);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "1024 bytes") != null);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+    try std.testing.expect(fixture.cfg.credential_helper == null);
+}
+
+test "config set credential_helper refuses when process execution is unavailable" {
+    const allocator = std.testing.allocator;
+
+    var fixture = try makeHelperConfigFixture(allocator);
+    defer fixture.deinit();
+
+    // No runner: the helper cannot be verified, so it must not be stored on the
+    // strength of looking plausible.
+    const runner = ConfigRunner{
+        .allocator = allocator,
+        .cfg = &fixture.cfg,
+        .args = &.{ "set", "credential_helper", "op read op://Private/Linear/api-key" },
+        .config_path = fixture.config_path,
+    };
+    const capture = try captureOutput(allocator, &runner, runConfigCommand);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "process execution is unavailable") != null);
+    try std.testing.expect(fixture.cfg.credential_helper == null);
+}
+
+test "config unset credential_helper remains the escape hatch" {
+    const allocator = std.testing.allocator;
+
+    var fixture = try makeHelperConfigFixture(allocator);
+    defer fixture.deinit();
+
+    var fake = FakeProcess{
+        .allocator = allocator,
+        .script = &.{.{ .stdout = fake_helper_key ++ "\n" }},
+    };
+    defer fake.deinit();
+
+    var runner = ConfigRunner{
+        .allocator = allocator,
+        .cfg = &fixture.cfg,
+        .args = &.{ "set", "credential_helper", "op read op://Private/Linear/api-key" },
+        .config_path = fixture.config_path,
+        .credential_runner = fake.runner(),
+    };
+    const set_capture = try captureOutput(allocator, &runner, runConfigCommand);
+    defer set_capture.deinit(allocator);
+    try std.testing.expectEqual(@as(u8, 0), set_capture.exit_code);
+
+    runner.args = &.{ "unset", "credential_helper" };
+    const unset_capture = try captureOutput(allocator, &runner, runConfigCommand);
+    defer unset_capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), unset_capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, unset_capture.stdout, "credential_helper reset") != null);
+    try std.testing.expect(fixture.cfg.credential_helper == null);
+    // Unsetting spawns nothing: it is the way out of a broken helper.
+    try std.testing.expectEqual(@as(usize, 1), fake.calls.items.len);
+
+    const written = try fixture.readConfig();
+    defer allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, "credential_helper") == null);
+}
+
+test "config set usage documents credential_helper as settable" {
+    const allocator = std.testing.allocator;
+
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer buffer.deinit();
+    try config_cmd.setUsage(&buffer.writer);
+
+    const text = buffer.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "credential_helper") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Read-only here") == null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "NO shell") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "unset credential_helper") != null);
+}
+
 // ---------------------------------------------------------------------------
 // Scrubbing the plaintext key off disk
 // ---------------------------------------------------------------------------
@@ -11177,7 +12639,13 @@ test "auth status names the backend without ever printing the key" {
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "credential_helper") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "present (valid)") != null);
+    // The label may not claim more than the offline charset/length check it is:
+    // a bare "valid" reads as "round-tripped against the API", which never
+    // happened here and never happens in this command.
+    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "present (format-valid, unverified)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "present (valid)") == null);
+    // And it points at the command that does verify.
+    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "linear auth test") != null);
     try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "op read op://Private/Linear/api-key") != null);
     // The whole point of `auth status` is that it answers the question `auth
     // show` gets used for, without the key reaching any stream.
@@ -11210,7 +12678,13 @@ test "auth status json reports the source and omits the key" {
     const obj = parsed.value.object;
     try std.testing.expectEqualStrings("file", obj.get("source").?.string);
     try std.testing.expectEqual(true, obj.get("key_present").?.bool);
-    try std.testing.expectEqual(true, obj.get("key_valid").?.bool);
+    try std.testing.expectEqual(true, obj.get("key_format_valid").?.bool);
+    // Renamed rather than redefined, so a consumer still reading `key_valid`
+    // breaks instead of quietly believing the key was checked against the API.
+    try std.testing.expect(obj.get("key_valid") == null);
+    // `auth status` never verifies, so this is null — not `false`, which would
+    // read as "checked and rejected".
+    try std.testing.expect(obj.get("key_verified").? == .null);
     try std.testing.expectEqual(true, obj.get("file_key_present").?.bool);
     try std.testing.expect(obj.get("credential_helper").? == .null);
     try std.testing.expect(obj.get("api_key") == null);

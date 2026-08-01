@@ -35,7 +35,13 @@ pub const comment_default_fields = [_]CommentField{ .id, .author, .created_at, .
 pub const comment_field_count = std.meta.fields(CommentField).len;
 
 pub const MilestoneField = enum { id, name, target_date, sort_order, description, project };
-pub const milestone_default_fields = [_]MilestoneField{ .id, .name, .target_date, .sort_order };
+/// `project` is a default column for the same reason `team` is one on
+/// `state_default_fields`: `milestone list` spans the whole workspace unless
+/// `--project` narrows it, and milestone names repeat across projects ("Beta",
+/// "GA"), so an unfiltered listing is ambiguous without it. The column stays on
+/// with `--project` too — a default field set that changed shape depending on a
+/// flag would make the table unscriptable and has no precedent here.
+pub const milestone_default_fields = [_]MilestoneField{ .id, .name, .target_date, .sort_order, .project };
 pub const milestone_field_count = std.meta.fields(MilestoneField).len;
 
 pub fn printJson(value: std.json.Value, writer: *Io.Writer, pretty: bool) !void {

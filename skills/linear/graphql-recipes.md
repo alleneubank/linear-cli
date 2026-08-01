@@ -304,18 +304,34 @@ has an enumerating command with `--fields`, `--limit`, and a `--quiet` mode that
 | User ids (`--assignee`) | `linear users list --limit 50 --fields id,name,email --data-only` |
 | Workflow state ids (`--state-id`) | `linear states list --team KEY --limit 50 --fields id,name,type --data-only` |
 | Label ids (`--label`, `--labels`) | `linear labels list --team KEY --limit 50 --fields id,name --data-only` |
-| Milestone ids (`--milestone`) | `linear milestone list --project ID\|NAME --limit 50 --fields id,name --data-only` |
+| Milestone ids (`--milestone`) | `linear milestone list [--project ID\|NAME] --limit 50 --fields id,name,project --data-only` |
 | Project ids | `linear projects list --fields id,name --limit 50` |
 
-One case the commands cannot express, where these queries are still the right tool:
+These commands cover the enumeration cases outright — do not reach for `gql` for any of them.
 
 ### Milestones across projects
 
-`linear milestone list` requires `--project`; there is no cross-project listing.
+`linear milestone list` no longer requires `--project`. Omit it and the command runs the root
+`projectMilestones` query with no filter; pass it and the same query gets
+`filter: { project: { id: { eq: <uuid> } } }`. The `Project` column is on by default so a
+workspace-wide listing stays unambiguous.
 
 ```bash
-linear gql --data-only 'query { projectMilestones(first: 100) { nodes { id name project { name } } } }'
+linear milestone list --all --fields id,name,project --data-only
 ```
+
+### More rows than one page holds
+
+Every list command walks cursors, so `gql --paginate` is not needed to get past page one:
+
+```bash
+linear users list --all --quiet
+linear labels list --team ENG --pages 3 --limit 50 --data-only
+linear projects list --all --fields id,name
+```
+
+`--max-items N` caps the total, and stderr prints the `--cursor` value to resume from. `search` and
+`issue comment list` are the only listings that still stop at `--limit`.
 
 ---
 

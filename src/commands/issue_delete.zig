@@ -26,7 +26,6 @@ const Options = struct {
     data_only: bool = false,
     yes: bool = false,
     dry_run: bool = false,
-    reason: ?[]const u8 = null,
     bulk: bulk.Options = .{},
     help: bool = false,
 };
@@ -39,7 +38,6 @@ const ItemState = struct {
     opts: Options,
     client: *graphql.GraphqlClient,
     api_key: []const u8,
-    reason: ?[]const u8,
     stderr: *std.Io.Writer,
     stdout: *std.Io.Writer,
     json_stream: bool,
@@ -93,15 +91,6 @@ pub fn run(ctx: Context) !u8 {
     const api_key = common.requireApiKey(ctx.config, null, stderr, "issue delete") catch {
         return 1;
     };
-    const reason = if (opts.reason) |raw_reason| blk: {
-        const trimmed = std.mem.trim(u8, raw_reason, " \t");
-        if (trimmed.len == 0) {
-            try stderr.print("issue delete: invalid --reason value\n", .{});
-            return 1;
-        }
-        break :blk trimmed;
-    } else null;
-
     // A dry run sends no mutation, so it stays usable without `--yes`.
     if (!opts.dry_run and !opts.yes) {
         try stderr.print("issue delete: confirmation required; re-run with --yes to proceed\n", .{});
@@ -130,7 +119,6 @@ pub fn run(ctx: Context) !u8 {
         .opts = opts,
         .client = &client,
         .api_key = api_key,
-        .reason = reason,
         .stderr = stderr,
         .stdout = stdout_iface,
         .json_stream = json_stream,
@@ -211,7 +199,6 @@ fn deleteOne(state: ItemState, index: usize, target: []const u8) !bulk.Outcome {
             try obj.object.put(var_alloc, "id", .{ .string = resolved_id });
             if (resolved_title) |title_value| try obj.object.put(var_alloc, "title", .{ .string = title_value });
             try obj.object.put(var_alloc, "dry_run", .{ .bool = true });
-            if (state.reason) |reason_value| try obj.object.put(var_alloc, "reason", .{ .string = reason_value });
             try state.emitJson(obj);
             return .succeeded;
         }
@@ -221,7 +208,6 @@ fn deleteOne(state: ItemState, index: usize, target: []const u8) !bulk.Outcome {
             defer data_pairs.deinit(ctx.allocator);
             try data_pairs.appendSlice(ctx.allocator, dry_data_pairs[0..]);
             if (resolved_title) |title_value| try data_pairs.append(ctx.allocator, .{ .key = "title", .value = title_value });
-            if (state.reason) |reason_value| try data_pairs.append(ctx.allocator, .{ .key = "reason", .value = reason_value });
             try printer.printKeyValuesPlain(stdout_iface, data_pairs.items);
             return .succeeded;
         }
@@ -233,7 +219,6 @@ fn deleteOne(state: ItemState, index: usize, target: []const u8) !bulk.Outcome {
 
         try stdout_iface.print("issue delete: dry run; would delete {s} (id {s})", .{ resolved_identifier, resolved_id });
         if (resolved_title) |title_value| try stdout_iface.print(" title \"{s}\"", .{title_value});
-        if (state.reason) |reason_value| try stdout_iface.print(" reason: {s}", .{reason_value});
         try stdout_iface.writeByte('\n');
         return .succeeded;
     }
@@ -286,14 +271,7 @@ fn deleteOne(state: ItemState, index: usize, target: []const u8) !bulk.Outcome {
     }
 
     if (ctx.json_output and !opts.quiet and !opts.data_only) {
-        if (state.reason) |reason_value| {
-            var root_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
-            try root_obj.object.put(var_alloc, "response", data_value);
-            try root_obj.object.put(var_alloc, "reason", .{ .string = reason_value });
-            try state.emitJson(root_obj);
-        } else {
-            try state.emitJson(data_value);
-        }
+        try state.emitJson(data_value);
         return .succeeded;
     }
 
@@ -318,10 +296,6 @@ fn deleteOne(state: ItemState, index: usize, target: []const u8) !bulk.Outcome {
         .{ .key = "identifier", .value = identifier },
         .{ .key = "id", .value = id_value },
     });
-    if (state.reason) |reason_value| {
-        try pairs.append(ctx.allocator, .{ .key = "Reason", .value = reason_value });
-        try data_pairs.append(ctx.allocator, .{ .key = "reason", .value = reason_value });
-    }
 
     if (opts.quiet) {
         try stdout_iface.writeAll(identifier);
@@ -383,17 +357,11 @@ fn parseOptions(args: []const []const u8) !Options {
             idx += 1;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--reason")) {
-            if (idx + 1 >= args.len) return error.MissingValue;
-            opts.reason = args[idx + 1];
-            idx += 2;
-            continue;
-        }
-        if (std.mem.startsWith(u8, arg, "--reason=")) {
-            opts.reason = arg["--reason=".len..];
-            idx += 1;
-            continue;
-        }
+        // `--reason` used to be accepted here and was never sent anywhere:
+        // `issueDelete` takes `(id, permanentlyDelete)` and has no reason
+        // parameter, so the value only ever reached this CLI's own stdout while
+        // reading like an audit trail in Linear. It is rejected as an unknown
+        // flag now rather than deprecated, the same clean break `--api-key` got.
         if (arg.len > 0 and arg[0] == '-') return error.UnknownFlag;
         if (opts.target == null) {
             opts.target = arg;
@@ -407,14 +375,13 @@ fn parseOptions(args: []const []const u8) !Options {
 
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear issue delete <ID|IDENTIFIER> [--quiet] [--data-only] [--yes] [--dry-run] [--reason TEXT] [--help]
+        \\Usage: linear issue delete <ID|IDENTIFIER> [--quiet] [--data-only] [--yes] [--dry-run] [--help]
         \\       linear issue delete --bulk ID,ID | --bulk-file PATH | --bulk-stdin [--yes] [--dry-run] [...]
         \\Flags:
         \\  --quiet          Print only the identifier
         \\  --data-only      Emit tab-separated fields without formatting (or JSON object with --json)
         \\  --yes            Skip confirmation prompt (useful for scripts; alias: --force)
         \\  --dry-run        Resolve and validate the issue without deleting; prints the target and exits 0
-        \\  --reason TEXT    Attach a reason (echoed in output; for audit logging)
         \\  --bulk ID,ID     Delete several issues in one serial run (ids are deduplicated)
         \\  --bulk-file PATH Read bulk ids from a file, one per line or comma separated ('-' for stdin)
         \\  --bulk-stdin     Read bulk ids from stdin

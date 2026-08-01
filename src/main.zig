@@ -146,6 +146,17 @@ fn run(init: std.process.Init) !u8 {
             );
             return 1;
         },
+        // A malformed `credential_helper` in the config file reaches the
+        // operator here, so it gets the same sentence `auth migrate` prints
+        // rather than a bare Zig error name like `TooManyCredentialHelperArgs`.
+        config.CredentialHelperError.EmptyCredentialHelper,
+        config.CredentialHelperError.TooManyCredentialHelperArgs,
+        config.CredentialHelperError.InvalidCredentialHelperArg,
+        config.CredentialHelperError.InvalidCredentialHelper,
+        => |helper_err| {
+            try stderr.print("failed to load config: {s}\n", .{config.credentialHelperErrorText(helper_err)});
+            return 1;
+        },
         else => {
             try stderr.print("failed to load config: {s}\n", .{@errorName(err)});
             return 1;
@@ -215,6 +226,7 @@ fn run(init: std.process.Init) !u8 {
             .retries = opts.retries,
             .timeout_ms = opts.timeout_ms,
             .endpoint = opts.endpoint,
+            .credential_runner = process.system_runner,
         });
     }
 

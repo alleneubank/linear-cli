@@ -683,6 +683,10 @@ pub fn build(b: *std.Build) void {
     config_cmd_mod.addImport("graphql", graphql_mod);
     config_cmd_mod.addImport("printer", printer_mod);
     config_cmd_mod.addImport("common", common_mod);
+    // `config set credential_helper` runs the helper before storing it, through
+    // the same audited subprocess layer every other backend uses.
+    config_cmd_mod.addImport("credentials", credentials_mod);
+    config_cmd_mod.addImport("process", process_mod);
     const config_cmd_test_mod = b.createModule(.{
         .root_source_file = b.path("src/commands/config.zig"),
         .target = target,
@@ -692,6 +696,8 @@ pub fn build(b: *std.Build) void {
     config_cmd_test_mod.addImport("graphql", graphql_mock_mod);
     config_cmd_test_mod.addImport("printer", printer_mod);
     config_cmd_test_mod.addImport("common", common_test_mod);
+    config_cmd_test_mod.addImport("credentials", credentials_mod);
+    config_cmd_test_mod.addImport("process", process_mod);
     tests_mod.addImport("config_cmd", config_cmd_test_mod);
 
     const auth_mod = b.createModule(.{
