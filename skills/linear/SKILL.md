@@ -68,14 +68,14 @@ when you actually want the files.
 | Flag | Available on | Default | Effect |
 |------|--------------|---------|--------|
 | `--fields LIST` | `issues list`, `issue view`, `issue comment list`, `projects list`, `project view`, `teams list`, `labels list`, `users list`, `states list`, `milestone list`, `gql` | command-specific (below) | Projection — print only these fields |
-| `--quiet` | `issues list`, `issue view`, `issue create`, `issue update`, `issue delete`, `issue link`, `issue comment`, `issue comment list`/`update`/`delete`, `issue start`, `project add-issue`/`remove-issue`, `labels list`, `users list`, `states list`, `milestone list`/`view`/`create`/`update`/`delete` | off | Identifiers only, one per line (comment id for `issue comment`, relation id for `issue link`, **bare UUIDs** for the enumeration commands) |
+| `--quiet` | `issues list`, `search`, `issue view`, `issue create`, `issue update`, `issue delete`, `issue link`, `issue comment`, `issue comment list`/`update`/`delete`, `issue start`, `project add-issue`/`remove-issue`, `labels list`, `users list`, `states list`, `milestone list`/`view`/`create`/`update`/`delete` | off | Identifiers only, one per line (comment id for `issue comment`, relation id for `issue link`, **bare UUIDs** for the enumeration commands) |
 | `--data-only` | same commands as `--quiet`, plus `gql` | off | Tab-separated rows; with `--json`, bare JSON instead of the wrapped envelope |
-| `--plain` | `issues list`, `issue comment list`, `projects list`, `teams list`, `labels list`, `users list`, `states list`, `milestone list` | off | No cell padding or truncation |
+| `--plain` | `issues list`, `search`, `issue comment list`, `projects list`, `teams list`, `labels list`, `users list`, `states list`, `milestone list` | off | No cell padding or truncation |
 | `--no-truncate` | same commands as `--plain` | off | Same effect as `--plain` in this CLI |
-| `--limit N` | `issues list` (25), `projects list` (50), `search` (25), `issue comment list` (50), `labels list` (50), `users list` (50), `states list` (50), `milestone list` (50) | see left | Page size **per request** (max results for `search`/`issue comment list`, which do not paginate) |
-| `--max-items N` | `issues list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | unset | Hard stop after N items across all pages (may truncate mid-page) |
-| `--pages N` | `issues list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | 1 | Fetch up to N pages |
-| `--cursor CURSOR` | `issues list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | unset | Resume pagination after a cursor |
+| `--limit N` | `issues list` (25), `projects list` (50), `search` (25), `issue comment list` (50), `labels list` (50), `users list` (50), `states list` (50), `milestone list` (50) | see left | Page size **per request** on every one of them |
+| `--max-items N` | `issues list`, `search`, `issue comment list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | unset | Hard stop after N items across all pages (may truncate mid-page) |
+| `--pages N` | `issues list`, `search`, `issue comment list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | 1 | Fetch up to N pages |
+| `--cursor CURSOR` | `issues list`, `search`, `issue comment list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | unset | Resume pagination after a cursor (for `issue comment list` the cursor comes from `.issue.comments.pageInfo`) |
 | `--sub-limit N` | `issues list`, `issue view` | 10 | Sub-issues per parent; **`0` disables the sub-query** |
 | `--comment-limit N` | `issue view` | 10 | Comments to fetch; `0` disables |
 | `--issue-limit N` | `project view` | 10 | Issues to fetch; `0` disables |
@@ -86,7 +86,7 @@ Flags that **add** output — only pass them when you need the extra data:
 | Flag | Available on | Effect |
 |------|--------------|--------|
 | `--include-projects` | `issues list` | Adds `project` and `milestone` columns and their sub-queries |
-| `--all` | `issues list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | Fetches every page until exhausted (conflicts with `--pages`) |
+| `--all` | `issues list`, `search`, `issue comment list`, `projects list`, `labels list`, `users list`, `states list`, `milestone list` | Fetches every page until exhausted (conflicts with `--pages`) |
 | `--attachment-dir DIR` | `issue view` | Downloads `uploads.linear.app` files from the description into DIR (created 0600). Off unless the flag is passed; `--attachment-dir ""` is the same as omitting it |
 
 ### You need X → use Y, not Z
@@ -143,14 +143,16 @@ Each of these has a plausible-looking wrong command. The wrong one is named on p
 **Wrong:** `linear search "auth" --fields identifier,title` → `search: invalid --fields value`.
 **Right:** `linear search "auth" --fields title,comments` (searches titles and comment bodies).
 
-### `search` cannot be made compact
+### `search` takes the output flags but has no output projection
 
-`search` has no `--fields`-for-output, no `--plain`, no `--no-truncate`, no `--quiet`, no `--data-only`.
-It always prints the default six columns.
+`search` accepts `--plain`, `--no-truncate`, `--quiet`, and `--data-only` with the same meaning they
+have everywhere else. What it does **not** have is a `--fields`-for-output: because `--fields` is
+already spent on choosing the search haystack, the printed table is fixed to the default six columns.
 
-**Wrong:** `linear search "auth" --plain` → `search: unknown flag` + usage, exit 1. It does not ignore the
-flag; it refuses to run.
-**Right:** `linear search "auth" --limit 5`, or use `linear issues list` when you need a projection.
+**Wrong:** `linear search "auth" --fields identifier,title --data-only` → `search: invalid --fields value`
+(those are not searchable fields).
+**Right:** `linear search "auth" --quiet` for identifiers, `linear search "auth" --data-only` for the
+fixed tab-separated projection, or `linear issues list --fields ...` when you need to choose columns.
 
 ### `--state` is a state *type* on `issues list`, a state *name* on `issue update`
 
@@ -613,6 +615,9 @@ linear issues list --team TEAM_KEY --assignee me --limit 20 --sub-limit 0 --quie
 ### Search issues
 ```bash
 linear search "keyword" --team TEAM_KEY --limit 10
+
+# Identifiers only, walking every page (capped so a broad query cannot run away)
+linear search "keyword" --team TEAM_KEY --all --max-items 100 --quiet
 ```
 
 ### What changed recently
@@ -736,6 +741,10 @@ linear issue comment list ENG-123 --limit 20 --fields id,author,created_at
 
 # Verbatim bodies for programmatic use — --json is required
 linear issue comment list ENG-123 --limit 20 --json | jq -r '.issue.comments.nodes[].body'
+
+# Every comment on a long thread; the cursor to resume from lives on the
+# nested connection, at .issue.comments.pageInfo.endCursor
+linear issue comment list ENG-123 --all --json | jq -r '.issue.comments.nodes[].body'
 ```
 
 ### Edit or remove a comment
@@ -1030,7 +1039,7 @@ not redirect stderr away.
 | `issues list: sub-issues limited to 10; additional sub-issues omitted` | Raise `--sub-limit`, or set `--sub-limit 0` if you never wanted them |
 | `issue view: comments limited to 10; additional comments omitted` | Raise `--comment-limit` |
 | `project view: issues limited to 10; additional issues omitted` | Raise `--issue-limit` |
-| `search: additional results available; pagination not implemented (resume with cursor XXX)` | `search` cannot paginate — narrow the query or use `issues list --cursor` |
+| `search: fetched N items across M pages; more available, resume with --cursor XXX` | Not an error — pass `--cursor XXX`, or `--pages N` / `--all` |
 | `search: 0 results (team filter: XXX)` | The team filter excluded everything; retry without `--team` |
 | `issue view: issue not found` / `<cmd>: issue 'X' not found` | Wrong identifier or no access |
 | `<cmd>: invalid issue identifier; expected TEAM-NUMBER` | Use `ENG-123` form or a UUID |
@@ -1047,7 +1056,8 @@ not redirect stderr away.
 | `labels list: invalid --team value` / `states list: invalid --team value` | `--team` was empty/whitespace |
 | `labels list: fetched N items across M pages; more available, resume with --cursor X` (same shape for `users`/`states`/`projects list`/`milestone list`) | Not an error — pass `--cursor X`, or `--pages N` / `--all` |
 | `labels list: stopped after N items due to --max-items` (same shape for the other list commands) | Not an error — raise `--max-items` if you need more |
-| `issue comment list: more comments available; pagination not implemented (endCursor X)` | `issue comment list` does not paginate — raise `--limit` |
+| `issue comment list: fetched N items across M pages; more available, resume with --cursor X` | Not an error — pass `--cursor X`, or `--pages N` / `--all` |
+| `<cmd>: issue 'X' not found` (from `issue comment list` mid-walk) | The issue went away or access was revoked; the walk stops rather than looping |
 | `<cmd>: ConflictingPageFlags` | `--all` and `--pages` are mutually exclusive; pass one |
 | `milestone list: project 'X' is ambiguous; pass the project id` | Two projects share the slug/name — use the id from `projects list` |
 | `milestone update: provide at least one of --name, --description, --description-file, --target-date, or --sort-order` | Supply a field flag |
@@ -1184,9 +1194,13 @@ Commands with `--json` return nested structures. Use these jq paths:
 `issues list --json` also carries `.pageInfo`, `.limit`, `.maxItems`, and `.sort` alongside `.issues`.
 
 Every enumeration command (`labels list`, `users list`, `states list`, `milestone list`,
-`issue comment list`) reshapes under `--data-only --json` into a flat `{"nodes": [...], "pageInfo": {...},
-"limit": N}` object — items at `.nodes[]`, keyed by the `--fields` names. That is the only JSON form in
-which `issue comment list` bodies stay verbatim *and* are projected.
+`issue comment list`) plus `search` reshapes under `--data-only --json` into a flat
+`{"nodes": [...], "pageInfo": {...}, "limit": N}` object — items at `.nodes[]`, keyed by the `--fields`
+names (`search` has no output projection, so its keys are the fixed issue columns plus `url`). That is
+the only JSON form in which `issue comment list` bodies stay verbatim *and* are projected.
+
+`.pageInfo` on all of them reflects where the **walk** stopped, not just the last response, so its
+`endCursor` is what to hand back to `--cursor`.
 
 Bulk `issue delete`/`milestone delete` under `--json` stream a JSON **array** of per-item objects to
 stdout; the succeeded/failed summary is suppressed there and only the exit code reports failure.

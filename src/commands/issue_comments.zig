@@ -31,7 +31,12 @@ const Mode = enum { list, update, delete };
 
 pub const ListOptions = struct {
     identifier: ?[]const u8 = null,
+    /// Page size per request, not a total; `--max-items` caps the total.
     limit: usize = 50,
+    max_items: ?usize = null,
+    cursor: ?[]const u8 = null,
+    pages: ?usize = null,
+    all: bool = false,
     fields: ?[]const u8 = null,
     plain: bool = false,
     no_truncate: bool = false,
@@ -116,6 +121,7 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
     const opts = parseListOptions(args) catch |err| {
         const message = switch (err) {
             error.InvalidLimit => "invalid --limit value",
+            error.InvalidPageCount => "invalid --pages value",
             else => @errorName(err),
         };
         try stderr.print("issue comment list: {s}\n", .{message});
@@ -147,6 +153,12 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
         try stderr.print("issue comment list: --limit must be greater than zero\n", .{});
         return 1;
     }
+    if (opts.max_items) |max_value| {
+        if (max_value == 0) {
+            try stderr.print("issue comment list: invalid --max-items value\n", .{});
+            return 1;
+        }
+    }
 
     var field_buf = std.ArrayListUnmanaged(printer.CommentField).empty;
     defer field_buf.deinit(ctx.allocator);
@@ -174,16 +186,20 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
     const var_alloc = arena.allocator();
 
     const limit_i64 = std.math.cast(i64, opts.limit) orelse return error.InvalidLimit;
+    // `id` and `first` are identical on every page; only `after` is rewritten.
     var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
     try variables.object.put(var_alloc, "id", .{ .string = target });
     try variables.object.put(var_alloc, "first", .{ .integer = limit_i64 });
 
+    // `Issue.comments` is a nested connection, so `after` threads into the inner
+    // field and the cursor state comes back at `data.issue.comments.pageInfo`
+    // rather than at the top level like every other list command.
     const query =
-        \\query IssueComments($id: String!, $first: Int!) {
+        \\query IssueComments($id: String!, $first: Int!, $after: String) {
         \\  issue(id: $id) {
         \\    id
         \\    identifier
-        \\    comments(first: $first) {
+        \\    comments(first: $first, after: $after) {
         \\      nodes { id body createdAt updatedAt url user { name } parent { id } }
         \\      pageInfo { hasNextPage endCursor }
         \\    }
@@ -197,74 +213,185 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
     client.timeout_ms = ctx.timeout_ms;
     if (ctx.endpoint) |ep| client.endpoint = ep;
 
-    var response = common.send(ctx.allocator, "issue comment list", &client, .{
-        .query = query,
-        .variables = variables,
-        .operation_name = "IssueComments",
-    }, stderr) catch {
-        return 1;
-    };
-    defer response.deinit();
-
-    common.checkResponse(ctx.io, "issue comment list", &response, stderr, api_key) catch {
-        return 1;
-    };
-
-    const data_value = response.data() orelse {
-        try stderr.print("issue comment list: response missing data\n", .{});
-        return 1;
-    };
-
-    const issue_obj = common.getObjectField(data_value, "issue") orelse {
-        try stderr.print("issue comment list: issue '{s}' not found\n", .{target});
-        return 1;
-    };
-    const comments_obj = common.getObjectField(issue_obj, "comments") orelse {
-        try stderr.print("issue comment list: comments missing in response\n", .{});
-        return 1;
-    };
-    const nodes_array = common.getArrayField(comments_obj, "nodes") orelse {
-        try stderr.print("issue comment list: nodes missing in response\n", .{});
-        return 1;
-    };
-    const page_info = common.getObjectField(comments_obj, "pageInfo");
-    const has_next = if (page_info) |pi| common.getBoolField(pi, "hasNextPage") orelse false else false;
-    const end_cursor = if (page_info) |pi| common.getStringField(pi, "endCursor") else null;
-
     const want_raw_nodes = ctx.json_output and !opts.data_only and !opts.quiet;
-    if (want_raw_nodes) {
-        var out_buf: [0]u8 = undefined;
-        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
-        try printer.printJson(data_value, &out_writer.interface, true);
-        return 0;
+
+    // Row fields are slices borrowed from each page's parsed body, so no page
+    // may be freed until every row has been printed; the whole `Response` is
+    // kept and released together at the end.
+    var responses = std.ArrayListUnmanaged(graphql.GraphqlClient.Response).empty;
+    defer {
+        for (responses.items) |*resp| resp.deinit();
+        responses.deinit(ctx.allocator);
     }
 
     var rows = std.ArrayListUnmanaged(CommentData).empty;
     defer rows.deinit(ctx.allocator);
+    var nodes_accumulator = std.ArrayListUnmanaged(std.json.Value).empty;
+    defer nodes_accumulator.deinit(ctx.allocator);
 
-    for (nodes_array.items) |node| {
-        if (node != .object) continue;
-        const id = common.getStringField(node, "id") orelse continue;
-        const body = common.getStringField(node, "body") orelse "";
-        const user_obj = common.getObjectField(node, "user");
-        const author = if (user_obj) |u| common.getStringField(u, "name") orelse "(unknown)" else "(unknown)";
-        const parent_obj = common.getObjectField(node, "parent");
-        const parent = if (parent_obj) |p| common.getStringField(p, "id") orelse "" else "";
-        try rows.append(ctx.allocator, .{
-            .id = id,
-            .author = author,
-            .body = body,
-            .body_display = try foldToSingleLine(var_alloc, body),
-            .created_at = common.getStringField(node, "createdAt") orelse "",
-            .updated_at = common.getStringField(node, "updatedAt") orelse "",
-            .parent = parent,
-            .url = common.getStringField(node, "url") orelse "",
-        });
+    // Identity of the issue the comments hang off, taken from the first page so
+    // the `--json` envelope keeps the shape the API returned.
+    var issue_id: ?[]const u8 = null;
+    var issue_identifier: ?[]const u8 = null;
+
+    var progress = common.PageProgress{};
+    const page_size = opts.limit;
+    var next_cursor = opts.cursor;
+    const page_limit: ?usize = if (opts.all) null else opts.pages orelse 1;
+
+    while (true) {
+        if (page_limit) |limit_pages| {
+            if (progress.pages >= limit_pages) break;
+        }
+
+        if (next_cursor) |cursor_value| {
+            try variables.object.put(var_alloc, "after", .{ .string = cursor_value });
+        }
+
+        var response = common.send(ctx.allocator, "issue comment list", &client, .{
+            .query = query,
+            .variables = variables,
+            .operation_name = "IssueComments",
+        }, stderr) catch {
+            return 1;
+        };
+        var response_owned = true;
+        errdefer if (response_owned) response.deinit();
+
+        // `errdefer` does not fire on `return 1` — that is a successful return
+        // of an exit code — so a rejected page is freed by hand here.
+        common.checkResponse(ctx.io, "issue comment list", &response, stderr, api_key) catch {
+            if (response_owned) response.deinit();
+            return 1;
+        };
+
+        try responses.append(ctx.allocator, response);
+        response_owned = false;
+        const resp = &responses.items[responses.items.len - 1];
+
+        const data_value = resp.data() orelse {
+            try stderr.print("issue comment list: response missing data\n", .{});
+            return 1;
+        };
+
+        // A null or absent `issue` is a real outcome (bad identifier, revoked
+        // access mid-walk), not something to index into.
+        const issue_obj = common.getObjectField(data_value, "issue") orelse {
+            try stderr.print("issue comment list: issue '{s}' not found\n", .{target});
+            return 1;
+        };
+        const comments_obj = common.getObjectField(issue_obj, "comments") orelse {
+            try stderr.print("issue comment list: comments missing in response\n", .{});
+            return 1;
+        };
+        const nodes_array = common.getArrayField(comments_obj, "nodes") orelse {
+            try stderr.print("issue comment list: nodes missing in response\n", .{});
+            return 1;
+        };
+
+        if (issue_id == null) issue_id = common.getStringField(issue_obj, "id");
+        if (issue_identifier == null) issue_identifier = common.getStringField(issue_obj, "identifier");
+
+        if (opts.max_items) |max_value| {
+            if (progress.items >= max_value) {
+                progress.max_items_reached = true;
+                break;
+            }
+        }
+
+        const take_count = @min(nodes_array.items.len, page_size);
+        const remaining_allowed = if (opts.max_items) |max_value| max_value - progress.items else take_count;
+        const allowed_count = @min(take_count, remaining_allowed);
+        const page_nodes = nodes_array.items[0..allowed_count];
+
+        progress.items += allowed_count;
+        if (opts.max_items) |max_value| {
+            if (progress.items >= max_value) progress.max_items_reached = true;
+        }
+        progress.pages += 1;
+
+        if (want_raw_nodes) {
+            for (page_nodes) |node| try nodes_accumulator.append(ctx.allocator, node);
+        } else {
+            for (page_nodes) |node| {
+                if (node != .object) continue;
+                const id = common.getStringField(node, "id") orelse continue;
+                const body = common.getStringField(node, "body") orelse "";
+                const user_obj = common.getObjectField(node, "user");
+                const author = if (user_obj) |u| common.getStringField(u, "name") orelse "(unknown)" else "(unknown)";
+                const parent_obj = common.getObjectField(node, "parent");
+                const parent = if (parent_obj) |p| common.getStringField(p, "id") orelse "" else "";
+                try rows.append(ctx.allocator, .{
+                    .id = id,
+                    .author = author,
+                    .body = body,
+                    .body_display = try foldToSingleLine(var_alloc, body),
+                    .created_at = common.getStringField(node, "createdAt") orelse "",
+                    .updated_at = common.getStringField(node, "updatedAt") orelse "",
+                    .parent = parent,
+                    .url = common.getStringField(node, "url") orelse "",
+                });
+            }
+        }
+
+        // The nested connection's own `pageInfo`, not the response root's.
+        const page_info = common.getObjectField(comments_obj, "pageInfo");
+        const has_next = if (page_info) |pi| common.getBoolField(pi, "hasNextPage") orelse false else false;
+        progress.end_cursor = if (page_info) |pi| common.getStringField(pi, "endCursor") else null;
+        progress.more_available = has_next;
+
+        if (allowed_count < take_count and opts.max_items != null) {
+            progress.max_items_reached = true;
+        }
+
+        if (take_count == 0 or allowed_count == 0) {
+            if (has_next) {
+                try stderr.print("issue comment list: received empty page; stopping pagination\n", .{});
+            }
+            break;
+        }
+
+        if (!has_next) break;
+        if (page_limit) |limit_pages| {
+            if (progress.pages >= limit_pages) break;
+        }
+        if (progress.max_items_reached) {
+            progress.more_available = true;
+            break;
+        }
+        if (progress.end_cursor == null) {
+            try stderr.print("issue comment list: missing endCursor for additional page\n", .{});
+            break;
+        }
+        next_cursor = progress.end_cursor;
     }
+
+    if (progress.max_items_reached) progress.more_available = true;
 
     var out_buf: [0]u8 = undefined;
     var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     const stdout_iface = &out_writer.interface;
+
+    if (want_raw_nodes) {
+        var nodes_value = std.json.Value{ .array = std.json.Array.init(var_alloc) };
+        try nodes_value.array.appendSlice(nodes_accumulator.items);
+
+        var comments_out = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try comments_out.object.put(var_alloc, "nodes", nodes_value);
+        try comments_out.object.put(var_alloc, "pageInfo", try pageInfoValue(var_alloc, progress));
+
+        var issue_out = std.json.Value{ .object = std.json.ObjectMap.empty };
+        if (issue_id) |value| try issue_out.object.put(var_alloc, "id", .{ .string = value });
+        if (issue_identifier) |value| try issue_out.object.put(var_alloc, "identifier", .{ .string = value });
+        try issue_out.object.put(var_alloc, "comments", comments_out);
+
+        var root_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try root_obj.object.put(var_alloc, "issue", issue_out);
+        try printer.printJson(root_obj, stdout_iface, true);
+
+        try common.printPageSummary(stderr, "issue comment list", progress, ctx.json_output);
+        return 0;
+    }
 
     if (opts.quiet) {
         for (rows.items) |row| {
@@ -283,13 +410,7 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
             }
             var root_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
             try root_obj.object.put(var_alloc, "nodes", .{ .array = out_array });
-
-            var page_info_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
-            try page_info_obj.object.put(var_alloc, "hasNextPage", .{ .bool = has_next });
-            if (end_cursor) |cursor_value| {
-                try page_info_obj.object.put(var_alloc, "endCursor", .{ .string = cursor_value });
-            }
-            try root_obj.object.put(var_alloc, "pageInfo", page_info_obj);
+            try root_obj.object.put(var_alloc, "pageInfo", try pageInfoValue(var_alloc, progress));
             try root_obj.object.put(var_alloc, "limit", .{ .integer = limit_i64 });
             try printer.printJson(root_obj, stdout_iface, true);
         } else {
@@ -319,15 +440,19 @@ fn runList(ctx: Context, args: [][]const u8) !u8 {
         try printer.printCommentTable(ctx.allocator, stdout_iface, table_rows.items, selected_fields, table_opts);
     }
 
-    if (has_next and !ctx.json_output) {
-        const cursor_value = end_cursor orelse "(unknown)";
-        try stderr.print(
-            "issue comment list: more comments available; pagination not implemented (endCursor {s})\n",
-            .{cursor_value},
-        );
-    }
-
+    try common.printPageSummary(stderr, "issue comment list", progress, ctx.json_output);
     return 0;
+}
+
+/// Renders the walk's final cursor state in the same `pageInfo` shape the API
+/// uses, so a `--json` consumer can resume with `--cursor` unchanged.
+fn pageInfoValue(allocator: Allocator, progress: common.PageProgress) !std.json.Value {
+    var page_info = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try page_info.object.put(allocator, "hasNextPage", .{ .bool = progress.more_available });
+    if (progress.end_cursor) |cursor_value| {
+        try page_info.object.put(allocator, "endCursor", .{ .string = cursor_value });
+    }
+    return page_info;
 }
 
 fn runUpdate(ctx: Context, args: [][]const u8) !u8 {
@@ -754,6 +879,48 @@ pub fn parseListOptions(args: []const []const u8) !ListOptions {
             idx += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--max-items")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.max_items = try std.fmt.parseInt(usize, args[idx + 1], 10);
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--max-items=")) {
+            opts.max_items = try std.fmt.parseInt(usize, arg["--max-items=".len..], 10);
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--cursor")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.cursor = args[idx + 1];
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--cursor=")) {
+            opts.cursor = arg["--cursor=".len..];
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pages")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            const value = try std.fmt.parseInt(usize, args[idx + 1], 10);
+            if (value == 0) return error.InvalidPageCount;
+            opts.pages = value;
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--pages=")) {
+            const value = try std.fmt.parseInt(usize, arg["--pages=".len..], 10);
+            if (value == 0) return error.InvalidPageCount;
+            opts.pages = value;
+            idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--all")) {
+            opts.all = true;
+            idx += 1;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--fields")) {
             if (idx + 1 >= args.len) return error.MissingValue;
             opts.fields = args[idx + 1];
@@ -793,6 +960,7 @@ pub fn parseListOptions(args: []const []const u8) !ListOptions {
         }
         return error.UnexpectedArgument;
     }
+    if (opts.all and opts.pages != null) return error.ConflictingPageFlags;
     return opts;
 }
 
@@ -892,10 +1060,14 @@ pub fn parseDeleteOptions(args: []const []const u8) !DeleteOptions {
 
 pub fn listUsage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear issue comment list [ID|IDENTIFIER] [--limit N] [--fields LIST] [--plain] [--no-truncate] [--quiet] [--data-only] [--help]
+        \\Usage: linear issue comment list [ID|IDENTIFIER] [--limit N] [--max-items N] [--cursor CURSOR] [--pages N|--all] [--fields LIST] [--plain] [--no-truncate] [--quiet] [--data-only] [--help]
         \\Without an identifier the issue is inferred from the current branch name.
         \\Flags:
-        \\  --limit N        Number of comments to fetch (default: 50)
+        \\  --limit N        Page size per request (default: 50)
+        \\  --max-items N    Stop after emitting N comments (may truncate within a page)
+        \\  --cursor CURSOR  Start pagination after the provided cursor
+        \\  --pages N        Fetch up to N pages (default: 1)
+        \\  --all            Fetch all pages until the end
         \\  --fields LIST    Comma-separated columns (id,author,body,created_at,updated_at,parent,url)
         \\  --plain          Do not pad or truncate table cells
         \\  --no-truncate    Disable ellipsis and padding in table cells
@@ -909,6 +1081,7 @@ pub fn listUsage(writer: anytype) !void {
         \\  linear issue comment list ENG-123
         \\  linear issue comment list ENG-123 --fields id,parent --data-only
         \\  linear issue comment list ENG-123 --json
+        \\  linear issue comment list ENG-123 --all --quiet
         \\
     , .{});
 }

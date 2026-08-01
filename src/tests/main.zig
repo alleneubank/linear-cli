@@ -1550,7 +1550,7 @@ fn readAll(allocator: std.mem.Allocator, fd: posix.fd_t) ![]u8 {
     return buffer.toOwnedSlice(allocator);
 }
 
-test "search renders table and warns about pagination with mock graphql" {
+test "search renders table and reports the resume cursor with mock graphql" {
     const allocator = std.testing.allocator;
 
     var server = mock_graphql.MockServer.init(allocator);
@@ -1587,8 +1587,13 @@ test "search renders table and warns about pagination with mock graphql" {
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expectEqualStrings(fixtures.issues_table, capture.stdout);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "pagination not implemented") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "cursor-2") != null);
+    // The fixture reports another page; the default one-page budget stops the
+    // walk and surfaces the cursor to resume from.
+    try std.testing.expectEqualStrings(
+        "search: fetched 2 items across 1 page; more available, resume with --cursor cursor-2\n",
+        capture.stderr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
 }
 
 test "search builds filters for selected fields" {
@@ -1712,6 +1717,308 @@ test "search builds filters for selected fields" {
     const team_eq = team_key.object.get("eq") orelse return error.TestExpectedResult;
     if (team_eq != .string) return error.TestExpectedResult;
     try std.testing.expectEqualStrings("TEAM", team_eq.string);
+}
+
+const SearchRunner = struct {
+    allocator: std.mem.Allocator,
+    cfg: *config.Config,
+    args: [][]const u8,
+    json_output: bool = false,
+};
+
+fn runSearchArgs(r: *const SearchRunner) !u8 {
+    return search_cmd.run(.{
+        .allocator = r.allocator,
+        .io = test_io,
+        .config = r.cfg,
+        .args = r.args,
+        .retries = 0,
+        .timeout_ms = 10_000,
+        .json_output = r.json_output,
+    });
+}
+
+/// One issue per page so a two-entry sequence exercises a real cursor hand-off
+/// through the top-level `issues` connection `search` shares with `issues list`.
+const search_page1 =
+    \\{
+    \\  "data": {
+    \\    "issues": {
+    \\      "nodes": [
+    \\        { "id": "issue-1", "identifier": "LIN-101", "title": "First offline issue", "state": { "name": "Todo", "type": "todo" }, "assignee": { "name": "Ada Lovelace" }, "priorityLabel": "High", "updatedAt": "2024-05-10T12:00:00Z", "url": "https://linear.app/example/issue/1" }
+    \\      ],
+    \\      "pageInfo": { "hasNextPage": true, "endCursor": "cursor-issue-1" }
+    \\    }
+    \\  }
+    \\}
+;
+const search_page2 =
+    \\{
+    \\  "data": {
+    \\    "issues": {
+    \\      "nodes": [
+    \\        { "id": "issue-2", "identifier": "LIN-102", "title": "Second offline issue", "state": { "name": "In Progress", "type": "in_progress" }, "assignee": { "name": "Grace Hopper" }, "priorityLabel": "Medium", "updatedAt": "2024-05-11T15:30:00Z", "url": "https://linear.app/example/issue/2" }
+    \\      ],
+    \\      "pageInfo": { "hasNextPage": false, "endCursor": "cursor-issue-2" }
+    \\    }
+    \\  }
+    \\}
+;
+
+test "search walks multiple pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.setSequence("SearchIssues", &.{ search_page1, search_page2 });
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "offline", "--limit", "1", "--pages", "2", "--quiet" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // Rows from page one are still readable after page two was parsed, which is
+    // only true because both responses are kept alive to the end.
+    try std.testing.expectEqualStrings("LIN-101\nLIN-102\n", capture.stdout);
+    try std.testing.expectEqualStrings("search: fetched 2 items across 2 pages\n", capture.stderr);
+    try std.testing.expectEqual(@as(usize, 2), server.request_count);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-issue-1\"") != null);
+}
+
+test "search truncates at max-items" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    // fixtures.issues_response carries two nodes on one page and hasNextPage.
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    // --all would otherwise run to the end; --max-items still stops it mid-page.
+    var args = [_][]const u8{ "offline", "--limit", "2", "--max-items", "1", "--all", "--quiet" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("LIN-101\n", capture.stdout);
+    try std.testing.expectEqualStrings(
+        "search: fetched 1 items across 1 page; more available, resume with --cursor cursor-2\n" ++
+            "search: stopped after 1 items due to --max-items\n",
+        capture.stderr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+}
+
+test "search resumes from a cursor" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", search_page2);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "offline", "--cursor", "cursor-issue-1", "--limit", "1", "--quiet" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("LIN-102\n", capture.stdout);
+    try std.testing.expectEqualStrings("search: fetched 1 items across 1 page\n", capture.stderr);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-issue-1\"") != null);
+}
+
+test "search rejects --all with --pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "offline", "--all", "--pages", "2" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr, "search: ConflictingPageFlags\n"));
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+
+    const conflicting = [_][]const u8{ "offline", "--all", "--pages", "2" };
+    try std.testing.expectError(error.ConflictingPageFlags, search_cmd.parseOptions(conflicting[0..]));
+}
+
+test "search quiet prints identifiers only" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "offline", "--quiet" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("LIN-101\nLIN-102\n", capture.stdout);
+}
+
+test "search data-only emits tab-separated rows" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "offline", "--data-only" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // The fixed `issue_default_fields` projection, then the url — the same
+    // record `issues list --data-only` writes.
+    try std.testing.expectEqualStrings(
+        "LIN-101\tFirst offline issue\tTodo\tAda Lovelace\tHigh\t2024-05-10T12:00:00Z\thttps://linear.app/example/issue/1\n" ++
+            "LIN-102\tSecond offline issue\tIn Progress\tGrace Hopper\tMedium\t2024-05-11T15:30:00Z\thttps://linear.app/example/issue/2\n",
+        capture.stdout,
+    );
+}
+
+test "search plain and no-truncate drop padding and truncation" {
+    const allocator = std.testing.allocator;
+
+    const expected =
+        "Identifier  Title  State  Assignee  Priority  Updated\n" ++
+        "LIN-101  First offline issue  Todo  Ada Lovelace  High  2024-05-10T12:00:00Z\n" ++
+        "LIN-102  Second offline issue  In Progress  Grace Hopper  Medium  2024-05-11T15:30:00Z\n";
+
+    // Both flags disable padding and ellipsis, so they must render identically.
+    for ([_][]const u8{ "--plain", "--no-truncate" }) |flag| {
+        var server = mock_graphql.MockServer.init(allocator);
+        defer server.deinit();
+        var scope = mock_graphql.useServer(&server);
+        defer scope.restore();
+        try server.set("SearchIssues", fixtures.issues_response);
+
+        var cfg = try makeTestConfig(allocator);
+        defer cfg.deinit();
+
+        var args = [_][]const u8{ "offline", flag };
+        const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+        const capture = try captureOutput(allocator, &runner, runSearchArgs);
+        defer capture.deinit(allocator);
+
+        try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+        try std.testing.expectEqualStrings(expected, capture.stdout);
+    }
+}
+
+test "search json keeps the issues envelope while merging pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.setSequence("SearchIssues", &.{ search_page1, search_page2 });
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "offline", "--limit", "1", "--pages", "2" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..], .json_output = true };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // The page summary is suppressed under --json so stdout stays parseable.
+    try std.testing.expectEqualStrings("", capture.stderr);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, capture.stdout, .{});
+    defer parsed.deinit();
+    const issues = parsed.value.object.get("issues") orelse return error.TestExpectedResult;
+    const nodes = issues.object.get("nodes") orelse return error.TestExpectedResult;
+    if (nodes != .array) return error.TestExpectedResult;
+    // Both pages merged into the one envelope the single-page form used to emit.
+    try std.testing.expectEqual(@as(usize, 2), nodes.array.items.len);
+    try expectStringField(nodes.array.items[0], "identifier", "LIN-101");
+    try expectStringField(nodes.array.items[1], "identifier", "LIN-102");
+
+    const page_info = issues.object.get("pageInfo") orelse return error.TestExpectedResult;
+    const has_next = page_info.object.get("hasNextPage") orelse return error.TestExpectedResult;
+    if (has_next != .bool) return error.TestExpectedResult;
+    try std.testing.expect(!has_next.bool);
+    try expectStringField(page_info, "endCursor", "cursor-issue-2");
+}
+
+test "parse search pagination and output options" {
+    const args = [_][]const u8{
+        "agent",       "--limit=5",
+        "--max-items", "12",
+        "--cursor",    "cursor-1",
+        "--pages",     "3",
+        "--plain",     "--no-truncate",
+        "--quiet",     "--data-only",
+    };
+    const opts = try search_cmd.parseOptions(args[0..]);
+    try std.testing.expectEqualStrings("agent", opts.query.?);
+    try std.testing.expectEqual(@as(usize, 5), opts.limit);
+    try std.testing.expectEqual(@as(usize, 12), opts.max_items.?);
+    try std.testing.expectEqualStrings("cursor-1", opts.cursor.?);
+    try std.testing.expectEqual(@as(usize, 3), opts.pages.?);
+    try std.testing.expect(!opts.all);
+    try std.testing.expect(opts.plain);
+    try std.testing.expect(opts.no_truncate);
+    try std.testing.expect(opts.quiet);
+    try std.testing.expect(opts.data_only);
+
+    const zero_pages = [_][]const u8{ "agent", "--pages", "0" };
+    try std.testing.expectError(error.InvalidPageCount, search_cmd.parseOptions(zero_pages[0..]));
 }
 
 test "issues list renders table and warns about pagination with mock graphql" {
@@ -7871,7 +8178,9 @@ test "issue comment list renders the default table" {
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expectEqualStrings(fixtures.issue_comments_table, capture.stdout);
-    try std.testing.expectEqualStrings("", capture.stderr);
+    // The walk now closes with the same fetched-count report as every other
+    // paginating list command instead of leaving stderr silent.
+    try std.testing.expectEqualStrings("issue comment list: fetched 3 items across 1 page\n", capture.stderr);
 
     const recorded = server.lastRequest() orelse return error.TestExpectedResult;
     try std.testing.expectEqualStrings("IssueComments", recorded.operation);
@@ -8020,7 +8329,7 @@ test "issue comment list requires an issue identifier" {
     try std.testing.expectEqualStrings("issue comment list: missing issue identifier\n", capture.stderr);
 }
 
-test "issue comment list warns when more comments remain" {
+test "issue comment list reports the resume cursor when more comments remain" {
     const allocator = std.testing.allocator;
     const truncated_payload =
         \\{
@@ -8056,10 +8365,274 @@ test "issue comment list warns when more comments remain" {
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
     try std.testing.expectEqualStrings("comment-9\n", capture.stdout);
+    // The default page budget is one page, so the walk stops here and hands the
+    // caller the cursor to resume from instead of declaring pagination missing.
     try std.testing.expectEqualStrings(
-        "issue comment list: more comments available; pagination not implemented (endCursor cursor-comment-9)\n",
+        "issue comment list: fetched 1 items across 1 page; more available, resume with --cursor cursor-comment-9\n",
         capture.stderr,
     );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+}
+
+/// One comment per page so a two-entry sequence exercises a real cursor
+/// hand-off through the nested `Issue.comments` connection.
+const comments_page1 =
+    \\{
+    \\  "data": {
+    \\    "issue": {
+    \\      "id": "issue-1",
+    \\      "identifier": "ENG-123",
+    \\      "comments": {
+    \\        "nodes": [
+    \\          { "id": "comment-1", "body": "First", "createdAt": "2024-01-01T00:00:00.000Z", "updatedAt": "2024-01-01T00:00:00.000Z", "url": "", "user": { "name": "Ada" }, "parent": null }
+    \\        ],
+    \\        "pageInfo": { "hasNextPage": true, "endCursor": "cursor-comment-1" }
+    \\      }
+    \\    }
+    \\  }
+    \\}
+;
+const comments_page2 =
+    \\{
+    \\  "data": {
+    \\    "issue": {
+    \\      "id": "issue-1",
+    \\      "identifier": "ENG-123",
+    \\      "comments": {
+    \\        "nodes": [
+    \\          { "id": "comment-2", "body": "Second", "createdAt": "2024-01-02T00:00:00.000Z", "updatedAt": "2024-01-02T00:00:00.000Z", "url": "", "user": { "name": "Grace" }, "parent": null }
+    \\        ],
+    \\        "pageInfo": { "hasNextPage": false, "endCursor": "cursor-comment-2" }
+    \\      }
+    \\    }
+    \\  }
+    \\}
+;
+
+test "issue comment list walks multiple pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.setSequence("IssueComments", &.{ comments_page1, comments_page2 });
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "ENG-123", "--limit", "1", "--pages", "2", "--quiet" };
+    const runner = ArgsRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runIssueCommentsArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // Rows from page one are still readable after page two was parsed, which is
+    // only true because both responses are kept alive to the end.
+    try std.testing.expectEqualStrings("comment-1\ncomment-2\n", capture.stdout);
+    try std.testing.expectEqualStrings("issue comment list: fetched 2 items across 2 pages\n", capture.stderr);
+    try std.testing.expectEqual(@as(usize, 2), server.request_count);
+
+    // `after` threads into the nested connection, not a top-level argument.
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-comment-1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, recorded.query, "comments(first: $first, after: $after)") != null);
+}
+
+test "issue comment list reads pageInfo from the nested comments connection" {
+    const allocator = std.testing.allocator;
+    // Decoy cursors sit at the response root and on the issue object. Only the
+    // one under `issue.comments` is the comment connection's own cursor, so
+    // reading either outer path would report the wrong resume point.
+    const decoy_payload =
+        \\{
+        \\  "data": {
+        \\    "pageInfo": { "hasNextPage": false, "endCursor": "root-decoy" },
+        \\    "issue": {
+        \\      "id": "issue-1",
+        \\      "identifier": "ENG-123",
+        \\      "pageInfo": { "hasNextPage": false, "endCursor": "issue-decoy" },
+        \\      "comments": {
+        \\        "nodes": [
+        \\          { "id": "comment-1", "body": "First", "createdAt": "2024-01-01T00:00:00.000Z", "updatedAt": "2024-01-01T00:00:00.000Z", "url": "", "user": { "name": "Ada" }, "parent": null }
+        \\        ],
+        \\        "pageInfo": { "hasNextPage": true, "endCursor": "nested-cursor" }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("IssueComments", decoy_payload);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "ENG-123", "--limit", "1", "--quiet" };
+    const runner = ArgsRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runIssueCommentsArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("comment-1\n", capture.stdout);
+    try std.testing.expectEqualStrings(
+        "issue comment list: fetched 1 items across 1 page; more available, resume with --cursor nested-cursor\n",
+        capture.stderr,
+    );
+}
+
+test "issue comment list fails cleanly when the response has no issue object" {
+    const allocator = std.testing.allocator;
+    // A null `issue` is what the API returns for an unknown identifier; the
+    // walk must report it rather than indexing into it.
+    const missing_issue =
+        \\{ "data": { "issue": null } }
+    ;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("IssueComments", missing_issue);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "ENG-404", "--all", "--quiet" };
+    const runner = ArgsRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runIssueCommentsArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expectEqualStrings("", capture.stdout);
+    try std.testing.expectEqualStrings("issue comment list: issue 'ENG-404' not found\n", capture.stderr);
+    // The walk stops on the first page rather than looping on a bad response.
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+}
+
+test "issue comment list truncates at max-items" {
+    const allocator = std.testing.allocator;
+    const two_on_a_page =
+        \\{
+        \\  "data": {
+        \\    "issue": {
+        \\      "id": "issue-1",
+        \\      "identifier": "ENG-123",
+        \\      "comments": {
+        \\        "nodes": [
+        \\          { "id": "comment-1", "body": "First", "createdAt": "2024-01-01T00:00:00.000Z", "updatedAt": "2024-01-01T00:00:00.000Z", "url": "", "user": { "name": "Ada" }, "parent": null },
+        \\          { "id": "comment-2", "body": "Second", "createdAt": "2024-01-02T00:00:00.000Z", "updatedAt": "2024-01-02T00:00:00.000Z", "url": "", "user": { "name": "Grace" }, "parent": null }
+        \\        ],
+        \\        "pageInfo": { "hasNextPage": true, "endCursor": "cursor-comment-2" }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("IssueComments", two_on_a_page);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    // --all would otherwise run to the end; --max-items still stops it mid-page.
+    var args = [_][]const u8{ "list", "ENG-123", "--limit", "2", "--max-items", "1", "--all", "--quiet" };
+    const runner = ArgsRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runIssueCommentsArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("comment-1\n", capture.stdout);
+    try std.testing.expectEqualStrings(
+        "issue comment list: fetched 1 items across 1 page; more available, resume with --cursor cursor-comment-2\n" ++
+            "issue comment list: stopped after 1 items due to --max-items\n",
+        capture.stderr,
+    );
+    try std.testing.expectEqual(@as(usize, 1), server.request_count);
+}
+
+test "issue comment list resumes from a cursor" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("IssueComments", comments_page2);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "ENG-123", "--cursor", "cursor-comment-1", "--limit", "1", "--quiet" };
+    const runner = ArgsRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runIssueCommentsArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings("comment-2\n", capture.stdout);
+    try std.testing.expectEqualStrings("issue comment list: fetched 1 items across 1 page\n", capture.stderr);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars = recorded.variables_json orelse return error.TestExpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, vars, "\"after\":\"cursor-comment-1\"") != null);
+}
+
+test "issue comment list rejects --all with --pages" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "list", "ENG-123", "--all", "--pages", "2" };
+    const runner = ArgsRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runIssueCommentsArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr, "issue comment list: ConflictingPageFlags\n"));
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+
+    const conflicting = [_][]const u8{ "ENG-123", "--all", "--pages", "2" };
+    try std.testing.expectError(error.ConflictingPageFlags, issue_comments_cmd.parseListOptions(conflicting[0..]));
+}
+
+test "parse issue comment list pagination options" {
+    const args = [_][]const u8{
+        "ENG-123",     "--limit=5",
+        "--max-items", "12",
+        "--cursor",    "cursor-1",
+        "--pages",     "3",
+    };
+    const opts = try issue_comments_cmd.parseListOptions(args[0..]);
+    try std.testing.expectEqualStrings("ENG-123", opts.identifier.?);
+    try std.testing.expectEqual(@as(usize, 5), opts.limit);
+    try std.testing.expectEqual(@as(usize, 12), opts.max_items.?);
+    try std.testing.expectEqualStrings("cursor-1", opts.cursor.?);
+    try std.testing.expectEqual(@as(usize, 3), opts.pages.?);
+    try std.testing.expect(!opts.all);
+
+    const zero_pages = [_][]const u8{ "ENG-123", "--pages", "0" };
+    try std.testing.expectError(error.InvalidPageCount, issue_comments_cmd.parseListOptions(zero_pages[0..]));
 }
 
 test "issue comment list passes the identifier and limit to the query" {
