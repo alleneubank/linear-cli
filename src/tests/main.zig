@@ -1423,6 +1423,18 @@ fn makeTestConfig(allocator: std.mem.Allocator) !config.Config {
     cfg.team_cache = std.StringHashMap([]const u8).init(allocator);
     try cfg.setApiKey("test-key");
     try cfg.setDefaultTeamId("test-team-id");
+    // Pin a scratch save path. Several command paths persist the team-key cache
+    // with `save(allocator, null)` (issue_create.zig, project_create.zig); with
+    // config_path unset, resolveSavePath falls through to $LINEAR_CONFIG and then
+    // $HOME/.config/linear/config.json, so running the suite would overwrite the
+    // operator's real credentials with these fixtures. Production is unaffected --
+    // config.load() always sets config_path -- but the test helper must too.
+    cfg.config_path = try std.fmt.allocPrint(
+        allocator,
+        "/tmp/linear-cli-test-{d}-config.json",
+        .{std.c.getpid()},
+    );
+    cfg.owned_config_path = true;
     return cfg;
 }
 
