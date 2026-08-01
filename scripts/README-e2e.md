@@ -77,7 +77,7 @@ scheme); `--endpoint https://evil.example.com` rejected (and the reason is the h
 `auth show` and `auth show --json` contain no `lin_api_`; `issue update` without `--yes`
 refused; `gql` mutation without `--yes` refused.
 
-**auth** — `auth status`, `auth status --json` (asserts `key_present`/`key_valid`),
+**auth** — `auth status`, `auth status --json` (asserts `key_present`/`key_format_valid`),
 `auth test`, `auth test --json`. All four also assert the absence of `lin_api_`.
 
 **read-only** — `me`, `me --json`, `teams list`, `teams list --json`, `labels list`,

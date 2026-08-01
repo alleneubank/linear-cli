@@ -779,7 +779,7 @@ assert "auth status" 0 --stdout-nonempty --contains "source" --not-contains "lin
 
 cli auth status --json
 assert "auth status --json" 0 \
-	--jq '.key_present == true and .key_valid == true' \
+	--jq '.key_present == true and .key_format_valid == true' \
 	--not-contains "lin_api_"
 
 cli auth test
