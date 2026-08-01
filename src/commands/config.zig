@@ -265,10 +265,10 @@ fn setDefaultOutput(ctx: Context, value: []const u8, stderr: anytype) !void {
 
 /// Stores a `credential_helper`, but only after proving the helper works.
 ///
-/// This is the only way to configure a helper without the API key touching
-/// disk first. The previous route — `auth set` (plaintext on disk) then
-/// `auth migrate --to helper` then rotate — defeats the point of the backend,
-/// whose entire premise is that the key is never written down.
+/// This is the only way to configure a helper, and the only setup route where
+/// the API key never touches disk at all — which is the backend's entire
+/// premise. Writing the key to `config.json` first and moving it afterwards
+/// defeats that: once it has been on disk it has to be rotated regardless.
 ///
 /// What made `config set credential_helper` unsafe was the missing
 /// verification, not the command. A stored-but-broken helper is not a soft
@@ -276,7 +276,7 @@ fn setDefaultOutput(ctx: Context, value: []const u8, stderr: anytype) !void {
 /// helper fails rather than falling through to any other backend, so saving one
 /// that does not work locks the operator out of their own credential. So the
 /// helper is spawned here and has to hand back a usable key before anything is
-/// written, which is the same bar `auth migrate` holds it to.
+/// written.
 ///
 /// The key the helper produces is used for exactly one thing — deciding whether
 /// to save — and is never printed, logged, stored, or returned. Only the argv,

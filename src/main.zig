@@ -147,8 +147,9 @@ fn run(init: std.process.Init) !u8 {
             return 1;
         },
         // A malformed `credential_helper` in the config file reaches the
-        // operator here, so it gets the same sentence `auth migrate` prints
-        // rather than a bare Zig error name like `TooManyCredentialHelperArgs`.
+        // operator here, so it gets the same sentence `config set
+        // credential_helper` prints rather than a bare Zig error name like
+        // `TooManyCredentialHelperArgs`.
         config.CredentialHelperError.EmptyCredentialHelper,
         config.CredentialHelperError.TooManyCredentialHelperArgs,
         config.CredentialHelperError.InvalidCredentialHelperArg,
@@ -653,10 +654,6 @@ fn routeHelp(io: std.Io, args: [][]const u8, stderr: anytype) !u8 {
                 try auth_command.statusUsage(out);
                 return 0;
             }
-            if (std.mem.eql(u8, tail[0], "migrate")) {
-                try auth_command.migrateUsage(out);
-                return 0;
-            }
         }
         try auth_command.usage(out);
         return 0;
@@ -905,7 +902,7 @@ fn printUsage(writer: anytype) !void {
     try writer.print(
         \\linear [--json] [--config PATH] [--endpoint URL] [--no-keepalive] [--retries N] [--timeout-ms MS] [--help] [--version] <command> [args]
         \\Commands:
-        \\  auth set|test|show|status|migrate  Manage or validate authentication
+        \\  auth set|test|show|status  Manage or validate authentication
         \\  config show|set|unset Manage CLI defaults (team/output/state filter)
         \\  me                   Show current user
         \\  teams list           List teams

@@ -89,7 +89,17 @@ fn readContentStdin(allocator: Allocator, io: std.Io, stderr: anytype, prefix: [
 
 pub fn requireApiKey(cfg: *config.Config, override_key: ?[]const u8, stderr: anytype, prefix: []const u8) ![]const u8 {
     const key = cfg.resolveApiKey(override_key) catch {
-        try stderr.print("{s}: missing API key; set LINEAR_API_KEY or run 'linear auth set'\n", .{prefix});
+        // `auth status` comes first because a configured-but-failing helper
+        // lands here too, and "set a key" is the wrong advice for that state.
+        try stderr.print(
+            "{s}: missing API key; run 'linear auth status' to see which backend is configured\n",
+            .{prefix},
+        );
+        try stderr.print(
+            "{s}: to set one up: 'linear config set credential_helper \"op read op://<vault>/<item>/<field>\"' " ++
+                "(preferred), 'linear auth set --to keychain' (macOS), or export LINEAR_API_KEY\n",
+            .{prefix},
+        );
         return CommandError.CommandFailed;
     };
     return key;
@@ -108,16 +118,26 @@ pub fn checkResponse(
             try stderr.print("{s}: {s}\n", .{ prefix, msg });
         }
         if (resp.status == 401) {
+            // The key exists and Linear rejected it, so the question is *which*
+            // backend produced it — `auth status` is the only thing that says.
             if (api_key) |key| {
                 var buf: [64]u8 = undefined;
                 const redacted = redactKey(key, &buf);
                 try stderr.print(
-                    "{s}: unauthorized (key {s}); verify LINEAR_API_KEY or run 'linear auth set'\n",
+                    "{s}: unauthorized (key {s}); run 'linear auth status' to see which backend supplied it\n",
                     .{ prefix, redacted },
                 );
             } else {
-                try stderr.print("{s}: unauthorized; verify LINEAR_API_KEY or run 'linear auth set'\n", .{prefix});
+                try stderr.print(
+                    "{s}: unauthorized; run 'linear auth status' to see which backend supplied the key\n",
+                    .{prefix},
+                );
             }
+            try stderr.print(
+                "{s}: then replace it: 'linear config set credential_helper \"op read op://<vault>/<item>/<field>\"' " ++
+                    "(preferred), 'linear auth set --to keychain' (macOS), or export LINEAR_API_KEY\n",
+                .{prefix},
+            );
         }
         try printRateLimit(io, prefix, resp.rate_limit, stderr);
         return CommandError.CommandFailed;

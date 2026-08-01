@@ -46,7 +46,8 @@ linear issue update ENG-123 --assignee me --yes 2>/tmp/linear.err || cat /tmp/li
 
 ```
 <cmd>: HTTP status 401
-<cmd>: unauthorized (key lin_...abcd); verify LINEAR_API_KEY or run 'linear auth set'
+<cmd>: unauthorized (key lin_...abcd); run 'linear auth status' to see which backend supplied it
+<cmd>: then replace it: 'linear config set credential_helper "op read op://<vault>/<item>/<field>"' (preferred), 'linear auth set --to keychain' (macOS), or export LINEAR_API_KEY
 ```
 
 **Causes:**
@@ -63,9 +64,11 @@ linear auth status
 # Does that key work? (one `viewer` request)
 linear auth test
 
-# Move a plaintext config-file key to a real backend
-linear auth migrate --to keychain
-linear auth migrate --to helper op read "op://<vault>/<item>/<field>"
+# Replace the key with one that is not on disk (preferred)
+linear config set credential_helper "op read op://<vault>/<item>/<field>"
+
+# macOS, no secret manager: the login keychain (stdin only, never argv)
+op read "op://<vault>/<item>/<field>" | linear auth set --to keychain
 ```
 
 `auth status` is the first command to run for any auth question, because a 401 does not say *which* of the
@@ -103,7 +106,12 @@ it is a no-op alias.
 
 ### Missing API Key
 
-**Symptom:** stderr shows `<cmd>: missing API key; set LINEAR_API_KEY or run 'linear auth set'`.
+**Symptom:** stderr shows
+
+```
+<cmd>: missing API key; run 'linear auth status' to see which backend is configured
+<cmd>: to set one up: 'linear config set credential_helper "op read op://<vault>/<item>/<field>"' (preferred), 'linear auth set --to keychain' (macOS), or export LINEAR_API_KEY
+```
 
 **Cause:** no backend in the chain produced a key — *or* a configured one failed. Resolution order,
 highest precedence first:
@@ -125,24 +133,24 @@ supplying the key somewhere else lower in the chain.
 linear config set credential_helper "op read op://<vault>/<item>/<field>"
 linear auth test
 
-# Option 2 (macOS, no secret manager): the login keychain. This one still needs
-# the bootstrap, because migrate moves a key that is already in the config file.
-op read "op://<vault>/<item>/<field>" | linear auth set
-linear auth migrate --to keychain
+# Option 2 (macOS, no secret manager): the login keychain. The key reaches
+# `security -i` on stdin, never in an argv, and is read back before this reports
+# success. It fails outright off macOS rather than writing the plaintext file.
+op read "op://<vault>/<item>/<field>" | linear auth set --to keychain
 
 # Option 3: environment variable (read on every run, never written to the config file)
 export LINEAR_API_KEY="lin_api_..."
 linear auth test
 
-# Option 4 (deprecated as a destination): leave it in the config file, plaintext
-linear auth set
+# Option 4 (deprecated as a destination): store it in the config file, plaintext
+linear auth set            # same as `linear auth set --to file`
 ```
 
 Prefer option 1: it is the only route where the key is never written to disk at all. Option 4 stores the
 key in cleartext and makes the CLI warn on every run that reads it (`warning: API key read from ...; the
-config file stores it in plaintext.`); it survives as the step `auth migrate` migrates *from*, which is
-what you need when a plaintext key is already on disk. A literal key typed after `export` lands in shell
-history and in the environment of every child process.
+config file stores it in plaintext.`); reach for it only when neither a secret manager nor the keychain is
+available. A literal key typed after `export` lands in shell history and in the environment of every child
+process.
 
 Nothing but the config file is ever written to disk: a key from the environment, a helper, or the keychain
 is never persisted, and a key already in the config file survives saves made while one of them is
@@ -169,7 +177,7 @@ linear: credential_helper 'CMD' produced something that is not a valid API key; 
 **Cause:** a configured helper that fails **clears the effective key instead of falling through**. Falling
 back would silently reinstate the plaintext config-file key the helper was configured to replace, so the
 chain stops at the failure. The keychain is not tried either. The key on disk is left untouched, so
-`auth migrate` can still find it later.
+`auth status` still reports `file_api_key: present (deprecated plaintext)`.
 
 The helper's **stdout is never printed, logged, or quoted** — that is where the secret is. Only the exit
 status and the first line of stderr (200 bytes, control bytes stripped) reach the diagnostic.
@@ -212,65 +220,71 @@ failed to load config: InvalidCredentialHelper
 The bounds are 16 argv elements, 1024 bytes per element, no empty elements, and the value must be a JSON
 array of strings — or a bare string, which is split on ASCII whitespace with the same no-shell rule.
 
-### Moving a Plaintext Key Off Disk
+### Getting Off a Plaintext Key
 
 **Symptom:** every run prints
 
 ```
-warning: API key read from /Users/you/.config/linear/config.json; the config file stores it in plaintext. Move it with 'linear auth migrate --to helper <command>' or 'linear auth migrate --to keychain'.
+warning: API key read from /Users/you/.config/linear/config.json; the config file stores it in plaintext.
+warning: delete /Users/you/.config/linear/config.json to clear it (it also holds default_team_id and team_cache), then set up a backend that keeps the key off disk: 'linear config set credential_helper "op read op://<vault>/<item>/<field>"' (preferred) or 'linear auth set --to keychain'. Rotate the old key in Linear either way.
 ```
 
 **Cause:** the deprecated file backend is what supplied the key. It warns every single time.
 
-**Solution:**
+**There is no `auth migrate`.** It was removed, and it should not be reconstructed by hand. Moving the key
+would still leave it disclosed: the CLI cannot un-write a file, and overwriting the bytes in place does not
+beat APFS copy-on-write, snapshots, Time Machine, or a synced folder that already captured it. The key has
+to be **rotated in Linear** regardless — and once it is being replaced, carrying the old one over to a
+nicer backend buys nothing. Deleting the file also clears the cruft that came with it (`default_team_id`,
+`team_cache`).
+
+**Solution — three steps, in this order:**
 
 ```bash
-linear auth migrate --to keychain
-linear auth migrate --to helper op read "op://<vault>/<item>/<field>"
-linear auth migrate --to helper "pass show linear/api-key"   # single argument, split on whitespace
+# 1. Put the key in a secret manager, and rotate the old one in Linear.
+
+# 2. Delete the config file. default_team_id and team_cache live there too, so
+#    they go with it.
+rm ~/.config/linear/config.json
+
+# 3. Set up again from scratch, then confirm what is live now.
+linear config set credential_helper "op read op://<vault>/<item>/<field>"
+#    macOS with no secret manager, instead of the helper:
+#    op read "op://<vault>/<item>/<field>" | linear auth set --to keychain
+linear config set default_team_id TEAM_KEY
+linear auth status        # source: credential_helper (or keychain)
+linear auth test
 ```
 
-`migrate` writes to the chosen backend, reads it back, and compares before the plaintext copy is removed,
-so a failed migration never leaves you without a credential. `--to` is required — it will not pick a
-backend for you. `--to helper` pushes nothing anywhere: put the key in the secret manager first, and the
-migration verifies the helper hands back the same one.
+**Delete before you configure, not after.** `credential_helper` is stored *in* `config.json`, so setting
+it first and deleting the file afterwards throws the new helper away along with the old key. `auth set
+--to keychain` writes nothing to the config file, so either order works for it — but the order above is
+correct for both.
 
-**Rotate the key afterwards.** `migrate` says so itself:
+**What the keychain does and does not buy you.** `auth set --to keychain` stores the key as a generic
+password (service `linear-cli`, account `api-key`) through `/usr/bin/security`, and the secret never
+appears in an argv on either the read or the write path — the write hands `security -i` its
+`add-generic-password` line on stdin. The item is read back and compared before the command reports
+success. The win is **encryption at rest** and immunity to accidental disclosure — backups, synced
+folders, a stray `cat` of the config, a screen share. It is **not** process isolation: the item is created
+through `security`, so it is ACL'd to `/usr/bin/security`, and any process running as you can read it back
+non-interactively with no prompt. The backend does not exist on Linux or Windows (`auth set: the keychain
+backend is only available on macOS; use 'linear config set credential_helper "<command>"' instead`) — it
+fails there rather than quietly writing the plaintext file.
 
-```
-api key migrated to keychain; the plaintext copy has been removed from the config file
-the key was on disk in plaintext, so treat it as disclosed and consider rotating it
-```
-
-Removal overwrites the old bytes in place before rewriting the file rather than truncating over them, but
-that is **best effort by nature**: on a copy-on-write filesystem (APFS) the overwrite may land on fresh
-blocks, and it says nothing about snapshots, Time Machine copies, or synced folders that already captured
-the file.
-
-**What the keychain does and does not buy you.** `--to keychain` stores the key as a generic password
-(service `linear-cli`, account `api-key`) read through `/usr/bin/security`, and the secret never appears
-in an argv on either the read or the write path. The win is **encryption at rest** and immunity to
-accidental disclosure — backups, synced folders, a stray `cat` of the config, a screen share. It is
-**not** process isolation: the item is created through `security`, so it is ACL'd to `/usr/bin/security`,
-and any process running as you can read it back non-interactively with no prompt. The backend does not
-exist on Linux or Windows (`auth migrate: the keychain backend is only available on macOS`); use a helper
-there.
-
-**Migration refusals** — all of these leave the plaintext key exactly where it was:
+**`auth set --to keychain` refusals** — none of these store anything:
 
 ```
-auth migrate: missing --to; expected '--to helper <command>' or '--to keychain'
-auth migrate: no API key in the config file to migrate
-auth migrate: '--to helper' needs the command that prints the API key
-auth migrate: credential_helper 'CMD' returned a different key than the config file holds; nothing was changed
-auth migrate: the keychain read back a different key than was written; nothing was changed
-auth migrate: the keychain item could not be read back after writing it; nothing was changed
-auth migrate: this API key starts with '-', which /usr/bin/security would read as an option; use '--to helper' instead
+auth set: UnknownBackend                                   # --to takes keychain or file, nothing else
+auth set: the keychain backend is only available on macOS; use 'linear config set credential_helper "<command>"' instead
+auth set: the keychain read back a different key than was written; the item holds something else
+auth set: the keychain item could not be read back after writing it; nothing was stored
+auth set: this API key starts with '-', which /usr/bin/security would read as an option; put it in a secret manager and use 'linear config set credential_helper "<command>"' instead
+auth set: process execution is unavailable
 ```
 
-`no API key in the config file to migrate` is the common one: only an on-disk key is migratable. A key
-from `LINEAR_API_KEY`, a helper, or the keychain is either not `migrate`'s to move or already where it
-belongs.
+The two read-back refusals are the important ones: `security -i` reports on the session rather than on
+each command it was fed, so an exit-0 write that stored nothing would otherwise look like success.
 
 ### Invalid API Key Format
 
@@ -907,7 +921,7 @@ not stored in the config file and survives the delete — on macOS `linear auth 
 report `source: keychain` with no config file at all.
 
 Deleting the file is not a secure erase of a key it contained — see
-[Moving a Plaintext Key Off Disk](#moving-a-plaintext-key-off-disk) and rotate the key.
+[Getting Off a Plaintext Key](#getting-off-a-plaintext-key) and rotate the key.
 
 ### Permission Issues
 Config should have mode 0600. If warnings appear:

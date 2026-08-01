@@ -312,25 +312,61 @@ config set: credential_helper 'op read op://Private/Linear/api-key' exited 1: va
 config set: credential_helper was not saved
 ```
 
-`auth migrate --to helper` is for the *other* situation: a plaintext key already on disk that needs
-moving. It verifies the helper hands back that exact key before scrubbing the plaintext copy.
+If a plaintext key is already on disk, there is nothing to migrate — set the helper up as above, then
+delete `~/.config/linear/config.json` and rotate the old key. See
+[Getting off a plaintext key](#getting-off-a-plaintext-key).
 
 ### A failing `credential_helper` clears the key — it does not fall through
 
 A configured helper that fails does **not** degrade to the keychain or the plaintext config file. That
 would silently reinstate the key the helper was configured to replace, so the chain stops, the failure is
 reported on stderr, and the effective key is cleared. The key already on disk survives untouched, so
-`auth migrate` can still find it.
+`auth status` still reports it as present.
 
 The consequence, and the escape hatch:
 
-- Every API command fails with `<cmd>: missing API key; set LINEAR_API_KEY or run 'linear auth set'`.
+- Every API command fails with `<cmd>: missing API key; run 'linear auth status' to see which backend is
+  configured`, followed by the line naming the ways to set one up.
 - `linear auth status` still runs and names the state (`source: credential_helper (failed)`, exit 1).
 - `linear config unset credential_helper` still runs — neither needs a key.
 
 **Wrong:** re-running the failing command with `--retries`, or assuming the config file key will cover it.
 **Right:** `linear auth status` to confirm the state, fix the helper, or
 `linear config unset credential_helper` to drop back to the next backend.
+
+### Getting off a plaintext key
+
+**There is no `auth migrate`.** Do not look for one, and do not try to reconstruct it. A key that reached
+`~/.config/linear/config.json` has been on disk in cleartext, and nothing the CLI can do walks that back:
+overwriting the bytes does not beat APFS copy-on-write, snapshots, Time Machine, or a synced folder that
+already captured the file. The key has to be **rotated in Linear** either way — and once it is being
+replaced, moving the old one somewhere nicer buys nothing.
+
+```bash
+# 1. Put the key in a secret manager, and rotate the old one in Linear.
+
+# 2. Delete the config file. default_team_id and team_cache live there too, so
+#    those reset with it.
+rm ~/.config/linear/config.json
+
+# 3. Set up again from scratch.
+linear config set credential_helper "op read op://<vault>/<item>/<field>"
+#    macOS, no secret manager, instead of the helper:
+#    op read "op://<vault>/<item>/<field>" | linear auth set --to keychain
+linear config set default_team_id TEAM_KEY
+linear auth status && linear auth test
+```
+
+**Delete before you configure, not after.** `credential_helper` is stored *in* `config.json`, so setting
+it first and deleting the file afterwards throws the new helper away along with the old key. `--to
+keychain` writes nothing to the config file, but the order above is correct for both.
+
+The per-run warning names the same steps:
+
+```
+warning: API key read from /Users/you/.config/linear/config.json; the config file stores it in plaintext.
+warning: delete /Users/you/.config/linear/config.json to clear it (it also holds default_team_id and team_cache), then set up a backend that keeps the key off disk: 'linear config set credential_helper "op read op://<vault>/<item>/<field>"' (preferred) or 'linear auth set --to keychain'. Rotate the old key in Linear either way.
+```
 
 ### UUID-only flags now have enumerating commands — do not reach for `gql`
 
@@ -516,20 +552,20 @@ linear help project create
   key, so a broken helper can never be persisted. See
   [Traps](#credential_helper-is-an-argv-array-not-a-shell-command-line) for the argv rule and the bounds.
 
-  Use `auth migrate --to helper` only when a plaintext key is **already** in the config file and needs
-  moving out. It pushes the key nowhere — it runs the helper, compares what the helper prints with the key
-  on disk, and only then scrubs the plaintext copy. Because that key was on disk, **rotate it afterwards**.
-- **macOS with no secret manager:** `linear auth migrate --to keychain` (item `linear-cli`/`api-key`, read
-  via `/usr/bin/security`; same `auth set` bootstrap). This buys **encryption at rest** and immunity to
-  accidental disclosure — backups, synced folders, a stray `cat` of the config. It is **not** process
-  isolation: the item is ACL'd to `/usr/bin/security`, so any process running as you can read it back
-  non-interactively with no prompt. The backend does not exist on Linux or Windows, and there is no
-  silent downgrade to a weaker local store.
+  A plaintext key already in the config file is **not** something to move. See
+  [Getting off a plaintext key](#getting-off-a-plaintext-key).
+- **macOS with no secret manager:** `op read ... | linear auth set --to keychain` (item
+  `linear-cli`/`api-key`, written and read via `/usr/bin/security`). The key reaches `security -i` on
+  stdin, never in an argv, and the item is read back and compared before the command reports success.
+  This buys **encryption at rest** and immunity to accidental disclosure — backups, synced folders, a
+  stray `cat` of the config. It is **not** process isolation: the item is ACL'd to `/usr/bin/security`,
+  so any process running as you can read it back non-interactively with no prompt. The backend does not
+  exist on Linux or Windows; `--to keychain` fails there rather than quietly writing the plaintext file.
 - **Ephemeral / CI:** `export LINEAR_API_KEY=...` — read on every run, outranks everything, never written
-  to disk. Nothing to migrate and nothing to clean up.
-- `linear auth set` (piped stdin, or a prompt with terminal echo disabled) is **deprecated** as a
-  destination: it stores the key in the config file in plaintext, and the file backend warns on every run
-  that reads it. It remains the entry point for the two `migrate` flows above.
+  to disk. Nothing to clean up.
+- `linear auth set` with no `--to` (or `--to file`) writes the config file in plaintext and is
+  **deprecated**: the file backend warns on every run that reads it. Reach for it only when neither a
+  secret manager nor the keychain is available.
 - There is no `--api-key` flag — keys are never accepted on argv, where any process on the machine could
   read them out of the process table
 - Keys must be 4-512 characters from `[A-Za-z0-9_-]`; anything else is rejected at every ingestion point
@@ -853,9 +889,9 @@ Commands marked † infer the issue from the current git branch when the ID is o
 | `linear states list` | List workflow states — ids for `issues list --state-id` |
 | `linear auth status` | Report which backend supplies the key and whether it is well-formed (offline; never prints it) |
 | `linear auth test` | Validate the current key against the API (`viewer`) |
-| `linear auth migrate --to keychain\|helper CMD...` | Move the plaintext config-file key to a real backend |
 | `linear auth show` | Print the configured key, redacted (`--reveal` needs a TTY) |
-| `linear auth set` | Store a key in the config file in plaintext — **deprecated**, prefer `migrate` |
+| `linear auth set --to keychain` | Store a key in the macOS keychain, read from stdin or a no-echo prompt |
+| `linear auth set` | Store a key in the config file in plaintext — **deprecated**, prefer `config set credential_helper` |
 | `linear me` | Show current user |
 | `linear gql` | Run raw GraphQL (mutation documents need `--yes`; supports `--dry-run`, `--paginate`) |
 | `linear download` | Download uploads.linear.app attachments |
@@ -918,13 +954,13 @@ not redirect stderr away.
 | stderr message | Fix |
 |----------------|-----|
 | `<cmd>: confirmation required; re-run with --yes to proceed` | Add `--yes` (or `--force`) |
-| `<cmd>: missing API key; set LINEAR_API_KEY or run 'linear auth set'` | Run `linear auth status` first — with a broken `credential_helper` the chain clears the key rather than falling through, and this is what every API command then says |
-| `<cmd>: unauthorized (key lin_...); verify LINEAR_API_KEY or run 'linear auth set'` | Key is invalid/revoked; `linear auth status` for which backend produced it, `linear auth test` to re-check |
+| `<cmd>: missing API key; run 'linear auth status' to see which backend is configured` (plus the follow-up line naming `config set credential_helper`, `auth set --to keychain`, and `LINEAR_API_KEY`) | Run `linear auth status` first — with a broken `credential_helper` the chain clears the key rather than falling through, and this is what every API command then says |
+| `<cmd>: unauthorized (key lin_...); run 'linear auth status' to see which backend supplied it` (plus the follow-up `then replace it: ...` line) | Key is invalid/revoked; `linear auth status` for which backend produced it, `linear auth test` to re-check |
 | `auth set: invalid API key; expected 4-512 characters from [A-Za-z0-9_-]` | The piped/typed key has stray bytes (a trailing `\r`, a wrapped line, a quote). Re-pipe the bare key; nothing was written to disk |
-| `failed to load config: api key must be 4-512 characters from [A-Za-z0-9_-]` | Same charset rule, applied to the key already in the config file or `LINEAR_API_KEY`. Re-run `linear auth set` |
+| `failed to load config: api key must be 4-512 characters from [A-Za-z0-9_-]` | Same charset rule, applied to the key already in the config file or `LINEAR_API_KEY`. Fix the value, or delete the config file and set the key up again |
 | `auth set: no API key supplied; pipe one on stdin or run interactively (LINEAR_API_KEY is never written to disk)` | stdin was empty and there is no TTY to prompt on. Pipe the key in; `auth set` will not persist an environment key |
 | `auth show: refusing to reveal the API key because stdout is not a terminal` | Drop `--reveal` — do not work around this. `linear auth status` says where the key comes from, `linear auth test` says whether it works |
-| `warning: API key read from PATH; the config file stores it in plaintext. Move it with 'linear auth migrate --to helper <command>' or 'linear auth migrate --to keychain'.` | Not an error — the deprecated file backend supplied the key, and says so on every run. Migrate, then treat the old key as disclosed and rotate it |
+| `warning: API key read from PATH; the config file stores it in plaintext.` + `warning: delete PATH to clear it (it also holds default_team_id and team_cache), then set up a backend that keeps the key off disk: 'linear config set credential_helper "..."' (preferred) or 'linear auth set --to keychain'. Rotate the old key in Linear either way.` | Not an error — the deprecated file backend supplied the key, and says so on every run. Follow the steps in [Getting off a plaintext key](#getting-off-a-plaintext-key); the old key has been on disk, so treat it as disclosed and rotate it |
 | `linear: credential_helper 'CMD' was not found on PATH` | Helper binary missing. Nothing falls through while it is broken — fix it, or `linear config unset credential_helper` |
 | `linear: credential_helper 'CMD' could not be started` | Spawn refused (not executable, bad interpreter). Same escape hatch |
 | `linear: credential_helper 'CMD' did not finish in time` | Killed at the 60 s budget — usually a helper blocked on a prompt nobody answered |
@@ -938,14 +974,12 @@ not redirect stderr away.
 | `config set: credential_helper was not saved` (preceded by the helper's own failure line) | `config set` runs the helper before storing it; a helper that fails, prints nothing, or prints a non-key is refused, because a stored-but-broken one clears the key rather than falling through |
 | `config set: team 'X' not found in workspace; default_team_id was not changed` | The lookup succeeded and the workspace has no such team — check `linear teams list --fields id,key`. Nothing was written |
 | `config set: could not verify team 'X'; default_team_id was not changed` | The lookup itself did not complete (timeout, 5xx, offline) — this is not a verdict on the team. Nothing was written; retry, or pass `--team` per command |
-| `auth migrate: missing --to; expected '--to helper <command>' or '--to keychain'` | `migrate` never picks a backend for you |
-| `auth migrate: no API key in the config file to migrate` | Only an on-disk key is migratable — an environment, helper, or keychain key is not `migrate`'s to move |
-| `auth migrate: '--to helper' needs the command that prints the API key` | Append the argv: `--to helper op read "op://<vault>/<item>/<field>"` |
-| `auth migrate: credential_helper 'CMD' returned a different key than the config file holds; nothing was changed` | `migrate` verifies, it does not upload — store the *same* key in the secret manager first |
-| `auth migrate: the keychain read back a different key than was written; nothing was changed` (also `... the keychain item could not be read back after writing it; ...`) | Write/read-back disagreed; the plaintext key is untouched |
-| `auth migrate: the keychain backend is only available on macOS` | Use `--to helper` on Linux/Windows |
-| `auth migrate: this API key starts with '-', which /usr/bin/security would read as an option; use '--to helper' instead` | The keychain write refuses rather than working around `security`'s tokenizer |
-| `auth migrate: failed to rewrite the config file: <ErrorName>` | The backend already holds the verified key, but the file was overwritten before the rewrite failed — check `linear config show` and restore any defaults |
+| `auth: unknown command: migrate` | `auth migrate` was removed. Follow [Getting off a plaintext key](#getting-off-a-plaintext-key): set up a helper or the keychain, delete the config file, rotate the key |
+| `auth set: UnknownBackend` | `--to` takes `keychain` or `file`, nothing else. There is no `--to helper` — use `linear config set credential_helper "<command>"` |
+| `auth set: the keychain backend is only available on macOS; use 'linear config set credential_helper "<command>"' instead` | `--to keychain` refuses on Linux/Windows rather than silently writing the plaintext file |
+| `auth set: the keychain item could not be read back after writing it; nothing was stored` (also `... read back a different key than was written; ...`) | The write reported success but the item is not there or holds something else. `security -i` reports on the session, not on each command, so the read-back is what decides |
+| `auth set: this API key starts with '-', which /usr/bin/security would read as an option; put it in a secret manager and use 'linear config set credential_helper "<command>"' instead` | The keychain write refuses rather than working around `security`'s tokenizer |
+| `auth set: process execution is unavailable` | `--to keychain` needs to spawn `/usr/bin/security`; it will not fall back to the file |
 | `<cmd>: HTTP status 429` + `<cmd>: rate limit: remaining 0/1500; reset in ~NNNNms` | Wait for the printed reset window |
 | `<cmd>: request timed out after 10000ms` | Raise `--timeout-ms`, add `--retries 2`, or lower `--limit` |
 | `linear: --endpoint rejected: endpoint must use https; set LINEAR_ALLOW_INSECURE_ENDPOINT=1 to allow other schemes` | Use an `https` URL; the env var is for mock/QA servers only |

@@ -67,27 +67,41 @@ Only the config file is ever written back to disk. A key that came from the envi
 - The array form is the documented one. It is **argv, not a command line**: no shell is spawned, so quotes, pipes, `;`, `$VAR`, and globs are ordinary bytes inside an argument, never syntax.
 - A bare string (`"credential_helper": "pass show linear/api-key"`) is accepted for convenience and split on whitespace with the same no-shell rule. Quoting is not supported — use the array form when an argument contains a space.
 - Configure it from the CLI with `linear config set credential_helper "op read op://Private/Linear/api-key"` — the string is split into argv by the same whitespace rule. The helper is **run once before it is stored** and must hand back a usable key; one that fails, prints nothing, or prints something that is not a key is refused and nothing is written. That check exists because a stored-but-broken helper clears the effective key instead of falling through, so saving one would lock you out. Bounds apply before anything is spawned: at most 16 arguments, 1024 bytes each. Nothing the helper writes to stdout is ever printed.
-- This is the bootstrap path that keeps the key off disk entirely: put the key in your secret manager, point a helper at it, done. `auth set` + `auth migrate` exists for the case where a plaintext key is already on disk and needs moving.
+- This is the bootstrap path that keeps the key off disk entirely: put the key in your secret manager, point a helper at it, done. Nothing else needs to happen — there is no separate move-it-off-disk step, because the key was never on disk.
 - Trailing whitespace and the newline every secret manager emits are trimmed, and the result is validated before it can reach an `Authorization` header.
 - Failures are reported by exit status and stderr. The helper's **stdout is never logged, printed, or quoted in a diagnostic** — that is where the secret is.
 - A helper that fails does **not** fall through to the config file. That would silently reinstate the plaintext key the helper was configured to replace, so the chain stops and the CLI reports the failure instead. `linear config unset credential_helper` still works in that state.
 - Bounded: 30s timeout, 4 KiB of output. A hung helper is killed rather than hanging the CLI.
 
-**macOS keychain** — used when no helper is configured. Reads run `/usr/bin/security find-generic-password -w -s linear-cli -a api-key`; the secret comes back on stdout, so nothing sensitive is ever in argv. A missing item is not an error, it just means the next backend gets its turn. On Linux and Windows this backend does not exist — there is no silent downgrade to some weaker local store.
+**macOS keychain** — used when no helper is configured. Write it with `linear auth set --to keychain`, which reads the key from piped stdin or a no-echo prompt and hands it to `/usr/bin/security -i` on **stdin**; the key never appears in an argv, where any process on the machine could read it out of the process table. The write is read back and compared before the command reports success. Reads run `/usr/bin/security find-generic-password -w -s linear-cli -a api-key`; the secret comes back on stdout, so nothing sensitive is in argv there either. A missing item is not an error, it just means the next backend gets its turn. On Linux and Windows this backend does not exist — `--to keychain` fails there rather than quietly writing the plaintext file.
+
+```bash
+op read op://Private/Linear/api-key | linear auth set --to keychain
+linear auth status        # source: keychain
+```
 
 What the keychain actually buys you: **encryption at rest** and immunity to accidental disclosure — backups, synced folders, a stray `cat ~/.config/linear/config.json`, a screen share. It is **not** process isolation. The item is created through `security`, so it is ACL'd to `/usr/bin/security`, and any process running as you can read it back non-interactively without a prompt.
 
-**Migrating off the plaintext file:**
+**Getting off the plaintext file:**
+
+There is no migrate command. A key that has been in `config.json` has been on disk in cleartext, and no amount of overwriting beats copy-on-write filesystems, snapshots, Time Machine, or synced folders — so it has to be rotated regardless. Once you are rotating it anyway, moving the old key buys nothing over starting fresh, and starting fresh also clears the rest of the file's accumulated state.
 
 ```bash
-linear auth migrate --to keychain
-linear auth migrate --to helper op read op://Private/Linear/api-key
-linear auth migrate --to helper "pass show linear/api-key"      # split on whitespace
+# 1. Put the key in a secret manager, then rotate the old one in Linear. It has
+#    been on disk in cleartext: treat it as disclosed.
+
+# 2. Delete the config file. It also holds default_team_id and team_cache, so
+#    those reset too.
+rm ~/.config/linear/config.json
+
+# 3. Set up again from scratch.
+linear config set credential_helper "op read op://<vault>/<item>/<field>"
+#    or, on macOS:  op read "op://<vault>/<item>/<field>" | linear auth set --to keychain
+linear config set default_team_id TEAM_KEY
+linear auth status && linear auth test
 ```
 
-`migrate` writes to the chosen backend, reads it back, and compares before removing the plaintext copy, so a failed migration never leaves you without a credential. `--to` is required: it will not pick a backend for you. `--to helper` does not push the key anywhere — put it in your secret manager first, and the migration verifies the helper hands back the same key.
-
-Removing the key overwrites the old bytes in place before rewriting the file, rather than truncating over them. That is best effort by nature: on a copy-on-write filesystem (APFS) the overwrite may land on fresh blocks, and it says nothing about snapshots or backups that already captured the file. **A key that has been on disk in plaintext should be treated as disclosed and rotated.**
+Delete before you configure, not after: `credential_helper` is stored *in* `config.json`, so setting it first and deleting the file afterwards would throw the new helper away with the old key. `--to keychain` is the exception — it writes nothing to the config file — but the order above works for both.
 
 ## CLI Overview
 Global flags:
@@ -101,9 +115,8 @@ Global flags:
 - `linear help <command>` — show command-specific help with examples
 
 Commands:
-- `auth set` — save a key to the config file, read from piped stdin or a no-echo interactive prompt. Fails when no key is supplied instead of persisting `LINEAR_API_KEY`. Deprecated: the file backend stores the key in plaintext, so prefer `auth migrate`.
+- `auth set [--to keychain|file]` — store a key, read from piped stdin or a no-echo interactive prompt. There is no `--api-key` flag; keys are never accepted on argv. Fails when no key is supplied instead of persisting `LINEAR_API_KEY`. `--to keychain` writes the macOS keychain through `security -i` (stdin, never argv) and verifies a read-back; it fails on other platforms rather than falling back. `--to file` is the default and is **deprecated**: it stores the key in `config.json` in plaintext and every run that reads it says so. Prefer `config set credential_helper`, which keeps the key off disk entirely.
 - `auth status [--json]` — report which backend supplied the key and whether it is *well-formed*, without ever printing the key and without touching the network. `key: present (format-valid, unverified)` is a charset/length check only — run `auth test` to verify the credential itself. JSON reports `key_present`, `key_format_valid`, and `key_verified` (always `null`; status never verifies). Exits non-zero when no well-formed key was found.
-- `auth migrate --to <keychain|helper COMMAND...>` — move the plaintext config-file key to a real backend, verifying a read-back before removing it. See [Credential backends](#credential-backends).
 - `auth test` — ping `viewer` to validate the key.
 - `auth show [--reveal]` — view the configured key; redacted unless `--reveal` is passed on a terminal.
 - `config show|set|unset` — view or update CLI defaults (team/output/state filter) without editing JSON. `credential_helper` can be set, shown, and unset here; setting it runs the helper first and refuses to save one that does not return a usable key.

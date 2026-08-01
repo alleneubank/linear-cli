@@ -356,11 +356,21 @@ pub fn resolve(
     }
 
     if (cfg.key_source == .file) {
+        // Deliberately a delete-and-start-fresh story rather than a move: the
+        // key has been on disk, so it must be rotated either way, and once it
+        // is being replaced there is nothing worth carrying over. Deleting the
+        // file also clears the rest of its accumulated state.
+        const path = cfg.config_path orelse "the config file";
         try stderr.print(
-            "warning: API key read from {s}; the config file stores it in plaintext. " ++
-                "Move it with 'linear auth migrate --to helper <command>' or " ++
-                "'linear auth migrate --to keychain'.\n",
-            .{cfg.config_path orelse "the config file"},
+            "warning: API key read from {s}; the config file stores it in plaintext.\n",
+            .{path},
+        );
+        try stderr.print(
+            "warning: delete {s} to clear it (it also holds default_team_id and team_cache), then set up " ++
+                "a backend that keeps the key off disk: " ++
+                "'linear config set credential_helper \"op read op://<vault>/<item>/<field>\"' (preferred) " ++
+                "or 'linear auth set --to keychain'. Rotate the old key in Linear either way.\n",
+            .{path},
         );
     }
 }

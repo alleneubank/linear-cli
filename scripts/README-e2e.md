@@ -132,8 +132,9 @@ the same commands with the identifier inferred from the branch name.
   cannot clean up. It is **not part of a normal run**. `--allow-pr` opts in; when it is
   set, `gh pr create` inherits the terminal and may prompt to push the branch, so the run
   needs a human watching it, and the PR must be closed manually afterwards.
-- **`auth set`, `auth migrate`** — they rewrite the operator's credential storage. A test
-  has no business moving someone's API key between backends.
+- **`auth set`** (either `--to file` or `--to keychain`) — it rewrites the operator's
+  credential storage. A test has no business writing someone's API key to their config
+  file or their login keychain.
 - **`config set`, `config unset`** — they mutate the real config file. The script only
   *reads* `config show` (to detect `default_output=json`).
 - **`download`, `issue view --attachment-dir`** — both need an existing

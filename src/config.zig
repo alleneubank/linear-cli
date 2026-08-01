@@ -240,26 +240,6 @@ pub const Config = struct {
         try file.writeStreamingAll(self.io, json_buffer.writer.buffered());
     }
 
-    /// `save`, preceded by overwriting whatever is currently on disk.
-    ///
-    /// Plain `save` truncates, which returns the old blocks — still holding the
-    /// previous `api_key` bytes — to the free list where they stay readable.
-    /// Overwriting in place first means the removed key is gone from the blocks
-    /// the file already owns, so this is what the "remove the plaintext key"
-    /// paths use.
-    ///
-    /// Best effort by nature: on a copy-on-write filesystem (APFS, Btrfs) the
-    /// overwrite may land on fresh blocks, and it says nothing about snapshots,
-    /// Time Machine copies, or synced folders that already captured the file.
-    /// Treat a key that has been on disk as disclosed and rotate it.
-    pub fn saveScrubbed(self: *const Config, allocator: Allocator, override_path: ?[]const u8) !void {
-        const path = try resolveSavePath(self, allocator, override_path);
-        defer allocator.free(path);
-
-        try scrubFile(self.io, path);
-        try self.save(allocator, override_path);
-    }
-
     /// Records a key supplied by the config file or an explicit `auth set`.
     /// This is the only provenance `save` writes back to disk.
     pub fn setApiKey(self: *Config, value: []const u8) !void {
@@ -294,8 +274,8 @@ pub const Config = struct {
     }
 
     /// Drops the effective key while leaving `file_api_key` alone, so the value
-    /// on disk survives for `auth migrate` even after the chain refused to use
-    /// it. Used when a configured helper fails: falling through to the
+    /// on disk is still reported by `auth status` even after the chain refused
+    /// to use it. Used when a configured helper fails: falling through to the
     /// deprecated plaintext key would be exactly the silent degradation the
     /// helper was configured to avoid.
     pub fn clearEffectiveApiKey(self: *Config, source: KeySource) void {
@@ -306,15 +286,6 @@ pub const Config = struct {
         self.api_key = null;
         self.owned_api_key = false;
         self.key_source = source;
-    }
-
-    /// Removes the persisted copy of the key so the next `save` writes no
-    /// `api_key` field. The effective key is a separate allocation and is left
-    /// in place.
-    pub fn clearFileApiKey(self: *Config) void {
-        if (self.file_api_key) |key| self.allocator.free(key);
-        self.file_api_key = null;
-        if (self.key_source == .file) self.clearEffectiveApiKey(.none);
     }
 
     fn replaceApiKey(self: *Config, owned_value: []const u8, source: KeySource) void {
@@ -601,28 +572,6 @@ pub fn splitCredentialHelper(allocator: Allocator, command: []const u8) ![][]con
     // `errdefer` above owns the cleanup on this path.
     if (list.items.len == 0) return CredentialHelperError.EmptyCredentialHelper;
     return list.toOwnedSlice(allocator);
-}
-
-/// Overwrites every byte of `path` with zeros and flushes them to the device.
-/// A missing file is not an error: there is then nothing to scrub.
-pub fn scrubFile(io: std.Io, path: []const u8) !void {
-    const file = std.Io.Dir.cwd().openFile(io, path, .{ .mode = .write_only }) catch |err| switch (err) {
-        error.FileNotFound => return,
-        else => return err,
-    };
-    defer file.close(io);
-
-    const size = try file.length(io);
-    if (size == 0) return;
-
-    const filler: [512]u8 = @splat(0);
-    var offset: u64 = 0;
-    while (offset < size) {
-        const chunk: usize = @intCast(@min(@as(u64, filler.len), size - offset));
-        try file.writePositionalAll(io, filler[0..chunk], offset);
-        offset += chunk;
-    }
-    try file.sync(io);
 }
 
 fn replaceRequiredString(allocator: Allocator, target: *[]const u8, owned: *bool, value: []const u8) !void {

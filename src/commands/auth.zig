@@ -27,7 +27,15 @@ pub const Context = struct {
     credential_runner: ?process.Runner = null,
 };
 
+/// Backend `auth set` writes the key to.
+///
+/// `file` is the historical behaviour and stays the default, so omitting the
+/// flag means exactly what it always meant. It is also the deprecated one: the
+/// key lands in `config.json` as plaintext and every run that reads it says so.
+pub const SetTarget = enum { file, keychain };
+
 const SetOptions = struct {
+    target: SetTarget = .file,
     help: bool = false,
 };
 
@@ -45,17 +53,6 @@ const ShowOptions = struct {
 };
 
 const StatusOptions = struct {
-    help: bool = false,
-};
-
-/// Backend `auth migrate` moves the key to. There is no default: picking one
-/// silently would decide where the operator's credential lives for them.
-pub const MigrateTarget = enum { helper, keychain };
-
-pub const MigrateOptions = struct {
-    target: ?MigrateTarget = null,
-    /// argv for `--to helper`, borrowed from the command line.
-    helper_argv: []const []const u8 = &.{},
     help: bool = false,
 };
 
@@ -82,9 +79,6 @@ pub fn run(ctx: Context) !u8 {
     }
     if (std.mem.eql(u8, sub, "status")) {
         return runStatus(ctx, rest);
-    }
-    if (std.mem.eql(u8, sub, "migrate")) {
-        return runMigrate(ctx, rest);
     }
 
     try stderr.print("auth: unknown command: {s}\n", .{sub});
@@ -165,12 +159,27 @@ fn runSet(ctx: Context, args: [][]const u8) !u8 {
         return 1;
     }
 
-    ctx.config.setApiKey(key.?) catch |err| switch (err) {
+    return switch (opts.target) {
+        .file => setToFile(ctx, key.?, stderr),
+        .keychain => setToKeychain(ctx, key.?, stderr),
+    };
+}
+
+/// The one message for a key that fails `config.isValidApiKey`, shared by both
+/// backends so the two cannot drift into describing different rules.
+fn printInvalidKey(stderr: anytype) !void {
+    try stderr.print(
+        "auth set: invalid API key; expected {d}-{d} characters from [A-Za-z0-9_-]\n",
+        .{ config.min_api_key_len, config.max_api_key_len },
+    );
+}
+
+/// Deprecated destination: the key is written to `config.json` in plaintext and
+/// every later run that reads it from there warns.
+fn setToFile(ctx: Context, key: []const u8, stderr: anytype) !u8 {
+    ctx.config.setApiKey(key) catch |err| switch (err) {
         config.ApiKeyError.InvalidApiKey => {
-            try stderr.print(
-                "auth set: invalid API key; expected {d}-{d} characters from [A-Za-z0-9_-]\n",
-                .{ config.min_api_key_len, config.max_api_key_len },
-            );
+            try printInvalidKey(stderr);
             return 1;
         },
         else => return err,
@@ -180,6 +189,108 @@ fn runSet(ctx: Context, args: [][]const u8) !u8 {
     var out_buf: [0]u8 = undefined;
     var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     try out_writer.interface.print("api key saved\n", .{});
+    return 0;
+}
+
+/// Stores the key in the login keychain, and never touches the config file.
+///
+/// The write goes through `credentials.writeKeychain`, which feeds `security
+/// -i` on stdin; there is no argv form, because argv is readable from the
+/// process table by anything running as this user.
+fn setToKeychain(ctx: Context, key: []const u8, stderr: anytype) !u8 {
+    // The backend simply does not exist elsewhere, and quietly writing the
+    // plaintext file instead would store the key somewhere the operator did
+    // not ask for.
+    if (!credentials.keychain_supported) {
+        try stderr.print(
+            "auth set: the keychain backend is only available on macOS; " ++
+                "use 'linear config set credential_helper \"<command>\"' instead\n",
+            .{},
+        );
+        return 1;
+    }
+
+    // `credentials.keychainWriteInput` asserts this, and its whole safety
+    // argument rests on it: the charset is what makes the `security -i` line
+    // untokenizable into anything but the intended command.
+    if (!config.isValidApiKey(key)) {
+        try printInvalidKey(stderr);
+        return 1;
+    }
+
+    const runner = ctx.credential_runner orelse {
+        try stderr.print("auth set: process execution is unavailable\n", .{});
+        return 1;
+    };
+
+    const write_outcome = credentials.writeKeychain(runner, ctx.allocator, ctx.io, key) catch |err| switch (err) {
+        credentials.KeychainWriteError.LeadingDash => {
+            try stderr.print(
+                "auth set: this API key starts with '-', which {s} would read as an option; " ++
+                    "put it in a secret manager and use 'linear config set credential_helper \"<command>\"' instead\n",
+                .{credentials.keychain_binary},
+            );
+            return 1;
+        },
+        else => return err,
+    };
+    defer write_outcome.deinit(ctx.allocator);
+
+    switch (write_outcome) {
+        .failure => |failure| {
+            try credentials.printFailure(failure, credentials.keychain_binary, stderr, "auth set");
+            return 1;
+        },
+        .absent => {},
+        .key => unreachable,
+    }
+
+    // Read back before claiming success. `security -i` reports on the session
+    // rather than on each command it was handed, so a write that quietly did
+    // nothing would otherwise look like a stored credential that is not there.
+    const read_outcome = try credentials.readKeychain(runner, ctx.allocator, ctx.io);
+    defer read_outcome.deinit(ctx.allocator);
+
+    switch (read_outcome) {
+        .key => |stored| {
+            if (!std.mem.eql(u8, stored, key)) {
+                try stderr.print(
+                    "auth set: the keychain read back a different key than was written; " ++
+                        "the item holds something else\n",
+                    .{},
+                );
+                return 1;
+            }
+        },
+        .absent => {
+            try stderr.print(
+                "auth set: the keychain item could not be read back after writing it; nothing was stored\n",
+                .{},
+            );
+            return 1;
+        },
+        .failure => |failure| {
+            try credentials.printFailure(failure, credentials.keychain_binary, stderr, "auth set");
+            return 1;
+        },
+    }
+
+    var out_buf: [0]u8 = undefined;
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
+    try out_writer.interface.print(
+        "api key stored in the keychain (service {s}, account {s})\n",
+        .{ credentials.keychain_service, credentials.keychain_account },
+    );
+
+    // The keychain outranks the config file, so a plaintext key left behind is
+    // no longer the one in use — which is exactly how it gets forgotten.
+    if (ctx.config.file_api_key != null) {
+        try stderr.print(
+            "warning: a plaintext api_key is still in {s}; delete that file to clear it " ++
+                "(it also holds default_team_id and team_cache) and rotate the old key in Linear\n",
+            .{ctx.config.config_path orelse "the config file"},
+        );
+    }
     return 0;
 }
 
@@ -424,188 +535,6 @@ fn runStatus(ctx: Context, args: [][]const u8) !u8 {
     return if (key_present and key_format_valid) 0 else 1;
 }
 
-/// Moves the plaintext key out of the config file and into a real backend.
-///
-/// The order is deliberate: write, then read back and compare, and only then
-/// remove the plaintext copy. A half-finished migration that has already
-/// deleted the file key would leave the operator with no credential at all.
-fn runMigrate(ctx: Context, args: [][]const u8) !u8 {
-    var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
-    var stderr = &stderr_writer.interface;
-    const opts = parseMigrateOptions(args) catch |err| {
-        try stderr.print("auth migrate: {s}\n", .{@errorName(err)});
-        try migrateUsage(stderr);
-        return 1;
-    };
-
-    if (opts.help) {
-        var out_buf: [0]u8 = undefined;
-        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
-        try migrateUsage(&out_writer.interface);
-        return 0;
-    }
-
-    const target = opts.target orelse {
-        try stderr.print("auth migrate: missing --to; expected '--to helper <command>' or '--to keychain'\n", .{});
-        try migrateUsage(stderr);
-        return 1;
-    };
-
-    // Only the on-disk key is migratable. An environment key is not ours to
-    // move, and a key already supplied by a helper or the keychain is done.
-    const file_key = ctx.config.file_api_key orelse {
-        try stderr.print("auth migrate: no API key in the config file to migrate\n", .{});
-        return 1;
-    };
-
-    const runner = ctx.credential_runner orelse {
-        try stderr.print("auth migrate: process execution is unavailable\n", .{});
-        return 1;
-    };
-
-    // `file_key` is freed by `clearFileApiKey` below, so the verification and
-    // the comparison both work off a copy that outlives it.
-    const expected = try ctx.allocator.dupe(u8, file_key);
-    defer {
-        @memset(expected, 0);
-        ctx.allocator.free(expected);
-    }
-
-    switch (target) {
-        .helper => {
-            if (opts.helper_argv.len == 0) {
-                try stderr.print("auth migrate: '--to helper' needs the command that prints the API key\n", .{});
-                try migrateUsage(stderr);
-                return 1;
-            }
-            const helper_argv = helperArgvFromArgs(ctx.allocator, opts.helper_argv) catch |err| switch (err) {
-                config.CredentialHelperError.EmptyCredentialHelper => {
-                    try stderr.print("auth migrate: '--to helper' needs the command that prints the API key\n", .{});
-                    return 1;
-                },
-                else => return err,
-            };
-            defer ctx.allocator.free(helper_argv);
-
-            ctx.config.setCredentialHelper(helper_argv) catch |err| switch (err) {
-                config.CredentialHelperError.EmptyCredentialHelper,
-                config.CredentialHelperError.TooManyCredentialHelperArgs,
-                config.CredentialHelperError.InvalidCredentialHelperArg,
-                config.CredentialHelperError.InvalidCredentialHelper,
-                => |helper_err| {
-                    try stderr.print("auth migrate: {s}\n", .{config.credentialHelperErrorText(helper_err)});
-                    return 1;
-                },
-                else => return err,
-            };
-            // `setCredentialHelper` only touched memory; nothing is written to
-            // disk unless the read-back below succeeds.
-            const argv = ctx.config.credential_helper.?;
-            const name = try credentials.helperName(ctx.allocator, argv);
-            defer ctx.allocator.free(name);
-
-            const outcome = try credentials.runHelper(runner, ctx.allocator, ctx.io, argv);
-            defer outcome.deinit(ctx.allocator);
-
-            switch (outcome) {
-                .key => |key| {
-                    if (!std.mem.eql(u8, key, expected)) {
-                        ctx.config.clearCredentialHelper();
-                        try stderr.print(
-                            "auth migrate: {s} returned a different key than the config file holds; nothing was changed\n",
-                            .{name},
-                        );
-                        return 1;
-                    }
-                    try ctx.config.setApiKeyFromProvider(key, .helper);
-                },
-                .absent => unreachable,
-                .failure => |failure| {
-                    ctx.config.clearCredentialHelper();
-                    try credentials.printFailure(failure, name, stderr, "auth migrate");
-                    return 1;
-                },
-            }
-        },
-        .keychain => {
-            if (!credentials.keychain_supported) {
-                try stderr.print("auth migrate: the keychain backend is only available on macOS\n", .{});
-                return 1;
-            }
-
-            const write_outcome = credentials.writeKeychain(runner, ctx.allocator, ctx.io, expected) catch |err| switch (err) {
-                credentials.KeychainWriteError.LeadingDash => {
-                    try stderr.print(
-                        "auth migrate: this API key starts with '-', which {s} would read as an option; " ++
-                            "use '--to helper' instead\n",
-                        .{credentials.keychain_binary},
-                    );
-                    return 1;
-                },
-                else => return err,
-            };
-            defer write_outcome.deinit(ctx.allocator);
-
-            switch (write_outcome) {
-                .failure => |failure| {
-                    try credentials.printFailure(failure, credentials.keychain_binary, stderr, "auth migrate");
-                    return 1;
-                },
-                .absent => {},
-                .key => unreachable,
-            }
-
-            const read_outcome = try credentials.readKeychain(runner, ctx.allocator, ctx.io);
-            defer read_outcome.deinit(ctx.allocator);
-
-            switch (read_outcome) {
-                .key => |key| {
-                    if (!std.mem.eql(u8, key, expected)) {
-                        try stderr.print(
-                            "auth migrate: the keychain read back a different key than was written; nothing was changed\n",
-                            .{},
-                        );
-                        return 1;
-                    }
-                    try ctx.config.setApiKeyFromProvider(key, .keychain);
-                },
-                .absent => {
-                    try stderr.print(
-                        "auth migrate: the keychain item could not be read back after writing it; nothing was changed\n",
-                        .{},
-                    );
-                    return 1;
-                },
-                .failure => |failure| {
-                    try credentials.printFailure(failure, credentials.keychain_binary, stderr, "auth migrate");
-                    return 1;
-                },
-            }
-        },
-    }
-
-    // Verified. Only now does the plaintext copy go away, and it goes away by
-    // overwriting the bytes rather than truncating over them.
-    ctx.config.clearFileApiKey();
-    ctx.config.saveScrubbed(ctx.allocator, ctx.config_path) catch |err| {
-        try stderr.print("auth migrate: failed to rewrite the config file: {s}\n", .{@errorName(err)});
-        return 1;
-    };
-
-    var out_buf: [0]u8 = undefined;
-    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
-    try out_writer.interface.print(
-        "api key migrated to {s}; the plaintext copy has been removed from the config file\n",
-        .{ctx.config.key_source.label()},
-    );
-    try out_writer.interface.print(
-        "the key was on disk in plaintext, so treat it as disclosed and consider rotating it\n",
-        .{},
-    );
-    return 0;
-}
-
 /// Renders argv for display. Helper argv is operator-supplied configuration,
 /// not a secret.
 fn joinArgv(allocator: Allocator, argv: []const []const u8) ![]u8 {
@@ -618,7 +547,9 @@ fn joinArgv(allocator: Allocator, argv: []const []const u8) ![]u8 {
     return buffer.toOwnedSlice(allocator);
 }
 
-fn parseSetOptions(args: [][]const u8) !SetOptions {
+/// `--to` names the destination backend and nothing else; the key itself still
+/// only ever arrives on stdin or the no-echo prompt. There is no `--api-key`.
+pub fn parseSetOptions(args: [][]const u8) !SetOptions {
     var opts = SetOptions{};
     var idx: usize = 0;
     while (idx < args.len) {
@@ -626,6 +557,19 @@ fn parseSetOptions(args: [][]const u8) !SetOptions {
         if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
             opts.help = true;
             idx += 1;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--to")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            const value = args[idx + 1];
+            if (std.mem.eql(u8, value, "file")) {
+                opts.target = .file;
+            } else if (std.mem.eql(u8, value, "keychain")) {
+                opts.target = .keychain;
+            } else {
+                return error.UnknownBackend;
+            }
+            idx += 2;
             continue;
         }
         if (arg.len > 0 and arg[0] == '-') return error.UnknownFlag;
@@ -689,64 +633,21 @@ pub fn parseStatusOptions(args: [][]const u8) !StatusOptions {
     return opts;
 }
 
-/// `--to helper` consumes every remaining argument as argv elements, which is
-/// how the array form is expressed on the command line. A single argument
-/// containing whitespace is split instead, so a copy-pasted one-liner works
-/// too — with no shell semantics, so quoting inside it is not supported.
-pub fn parseMigrateOptions(args: [][]const u8) !MigrateOptions {
-    var opts = MigrateOptions{};
-    var idx: usize = 0;
-    while (idx < args.len) {
-        const arg = args[idx];
-        if (std.mem.eql(u8, arg, "--help") or std.mem.eql(u8, arg, "-h")) {
-            opts.help = true;
-            idx += 1;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "--to")) {
-            if (idx + 1 >= args.len) return error.MissingValue;
-            const value = args[idx + 1];
-            if (std.mem.eql(u8, value, "helper")) {
-                opts.target = .helper;
-                opts.helper_argv = args[idx + 2 ..];
-                return opts;
-            }
-            if (std.mem.eql(u8, value, "keychain")) {
-                opts.target = .keychain;
-                idx += 2;
-                continue;
-            }
-            return error.UnknownBackend;
-        }
-        if (arg.len > 0 and arg[0] == '-') return error.UnknownFlag;
-        return error.UnexpectedArgument;
-    }
-    return opts;
-}
-
-/// Expands `--to helper`'s trailing arguments into argv.
-///
-/// Caller owns the returned slice; the elements borrow `args`. A single
-/// argument is whitespace-split, anything else is taken verbatim.
-pub fn helperArgvFromArgs(allocator: Allocator, args: []const []const u8) ![][]const u8 {
-    if (args.len == 1) return config.splitCredentialHelper(allocator, args[0]);
-    return allocator.dupe([]const u8, args);
-}
-
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear auth <set|test|show|status|migrate> [args]
+        \\Usage: linear auth <set|test|show|status> [args]
         \\Commands:
-        \\  set      Store an API key in the config file (deprecated; prefer migrate)
+        \\  set      Store an API key in the keychain (macOS) or the config file
         \\  show     Display the configured API key (redacted by default)
         \\  status   Report which backend supplies the API key
-        \\  migrate  Move the plaintext config-file key to a real backend
         \\  test     Validate the configured API key
         \\Resolution order:
         \\  LINEAR_API_KEY > credential_helper > keychain (macOS) > config file
+        \\Preferred setup keeps the key off disk entirely:
+        \\  linear config set credential_helper "op read op://<vault>/<item>/<field>"
         \\Examples:
         \\  linear auth status
-        \\  linear auth migrate --to keychain
+        \\  linear auth set --to keychain
         \\  linear auth test
         \\
     , .{});
@@ -754,15 +655,27 @@ pub fn usage(writer: anytype) !void {
 
 pub fn setUsage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear auth set [--help]
+        \\Usage: linear auth set [--to keychain|file] [--help]
         \\Reads the API key from piped stdin, or prompts for it with terminal echo
         \\disabled. Keys are never accepted on argv, and a key that came from
         \\LINEAR_API_KEY is never written to disk.
+        \\
+        \\Prefer a credential_helper over either backend below — the key then never
+        \\touches disk at all:
+        \\  linear config set credential_helper "op read op://<vault>/<item>/<field>"
+        \\
+        \\To clear old credentials, delete ~/.config/linear/config.json and set up
+        \\again; it also holds default_team_id and team_cache, so those reset too.
+        \\Rotate the old key in Linear if it was ever stored there in plaintext.
         \\Flags:
+        \\  --to keychain    Store the key in the macOS keychain via /usr/bin/security
+        \\  --to file        Store the key in the config file, in plaintext. The
+        \\                   default, and deprecated: every run that reads it warns
         \\  --help           Show this help message
         \\Examples:
-        \\  linear auth set
+        \\  op read op://Private/Linear/api-key | linear auth set --to keychain
         \\  cat key.txt | linear auth set
+        \\  linear auth set
         \\
     , .{});
 }
@@ -810,32 +723,6 @@ pub fn statusUsage(writer: anytype) !void {
         \\  linear auth status
         \\  linear auth status --json
         \\  linear auth test
-        \\
-    , .{});
-}
-
-pub fn migrateUsage(writer: anytype) !void {
-    try writer.print(
-        \\Usage: linear auth migrate --to <keychain|helper COMMAND...> [--help]
-        \\Moves the plaintext API key out of the config file. The key is written to
-        \\the chosen backend, read back, and compared before the plaintext copy is
-        \\removed, so a failed migration never leaves you without a credential.
-        \\
-        \\'--to helper' does not push the key anywhere: put it in your secret manager
-        \\first, then point the helper at it. The migration verifies the helper hands
-        \\back the same key before removing the plaintext one.
-        \\
-        \\A helper is an argv array, never a shell command line: no quoting, no pipes,
-        \\no variable expansion. A single argument is split on whitespace as a
-        \\convenience; pass separate arguments when any of them contains a space.
-        \\Flags:
-        \\  --to keychain       Store the key in the macOS keychain via /usr/bin/security
-        \\  --to helper CMD...  Store the helper argv in credential_helper
-        \\  --help              Show this help message
-        \\Examples:
-        \\  linear auth migrate --to keychain
-        \\  linear auth migrate --to helper op read op://Private/Linear/api-key
-        \\  linear auth migrate --to helper "pass show linear/api-key"
         \\
     , .{});
 }

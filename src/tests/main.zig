@@ -11678,7 +11678,14 @@ test "credentials: the config file is the last resort and says so" {
     // file is.
     const text = diagnostics.written();
     try std.testing.expect(std.mem.indexOf(u8, text, "plaintext") != null);
-    try std.testing.expect(std.mem.indexOf(u8, text, "auth migrate") != null);
+    // The warning names both replacements and the delete-and-start-fresh step,
+    // because a key that has been on disk has to be rotated regardless.
+    try std.testing.expect(std.mem.indexOf(u8, text, "config set credential_helper") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "auth set --to keychain") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "team_cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Rotate the old key in Linear") != null);
+    // The command it used to point at is gone; nothing may still advertise it.
+    try std.testing.expect(std.mem.indexOf(u8, text, "auth migrate") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, fake_file_key) == null);
 }
 
@@ -11761,7 +11768,7 @@ test "credentials: a failing helper never falls back to the plaintext file key" 
     // silent degradation this chain exists to prevent.
     try std.testing.expectEqual(config.KeySource.helper_failed, result.cfg.key_source);
     try std.testing.expect(result.cfg.api_key == null);
-    // The key on disk survives, so `auth migrate` can still find it.
+    // The key on disk survives, so `auth status` can still report it.
     try std.testing.expectEqualStrings(fake_file_key, result.cfg.file_api_key.?);
     // The keychain is not tried either; the chain stops at the failure.
     try std.testing.expectEqual(@as(usize, 1), calls);
@@ -12054,7 +12061,7 @@ test "credentials: a keychain write that fails is reported by exit status" {
 
     var diagnostics: std.Io.Writer.Allocating = .init(allocator);
     defer diagnostics.deinit();
-    try credentials.printFailure(outcome.failure, "/usr/bin/security", &diagnostics.writer, "auth migrate");
+    try credentials.printFailure(outcome.failure, "/usr/bin/security", &diagnostics.writer, "auth set");
     const text = diagnostics.written();
     try std.testing.expect(std.mem.indexOf(u8, text, "exited 45") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, fake_keychain_key) == null);
@@ -12214,8 +12221,8 @@ test "credentialHelperErrorText covers every credential_helper rejection" {
 // config set credential_helper
 //
 // Bootstrapping a helper must not require the key to be written to disk first.
-// The old route was `auth set` (plaintext on disk) -> `auth migrate` -> rotate,
-// which defeats the backend's whole premise. What made `config set` unsafe was
+// The old route was `auth set` (plaintext on disk) -> move it -> rotate, which
+// defeats the backend's whole premise. What made `config set` unsafe was
 // the missing verification, so the helper is run here before it is stored: a
 // stored-but-broken helper *clears* the effective key instead of falling
 // through, and would lock the operator out of their own credential.
@@ -12250,9 +12257,12 @@ fn runConfigCommand(r: *const ConfigRunner) !u8 {
     });
 }
 
-/// A config file holding nothing but defaults — no key anywhere, which is the
-/// state an operator who never wants the key on disk starts from.
-const HelperConfigFixture = struct {
+/// A real config file in a temp dir holding nothing but defaults — no key
+/// anywhere, which is the state an operator who never wants the key on disk
+/// starts from. Shared by the `config set credential_helper` and `auth set`
+/// sections; `LINEAR_API_KEY`/`LINEAR_CONFIG` are cleared and restored so
+/// nothing here can reach the operator's own config.
+const ScratchConfigFixture = struct {
     tmp: std.testing.TmpDir,
     /// `realPathFileAlloc` returns a sentinel-terminated slice; keeping the
     /// sentinel in the type is what makes the matching `free` the right size.
@@ -12263,7 +12273,7 @@ const HelperConfigFixture = struct {
     saved_config_env: ?[]u8,
     allocator: std.mem.Allocator,
 
-    fn deinit(self: *HelperConfigFixture) void {
+    fn deinit(self: *ScratchConfigFixture) void {
         self.cfg.deinit();
         self.allocator.free(self.config_path);
         self.allocator.free(self.dir_path);
@@ -12272,12 +12282,12 @@ const HelperConfigFixture = struct {
         restoreEnv(config_env_name_z, self.saved_config_env, self.allocator);
     }
 
-    fn readConfig(self: *HelperConfigFixture) ![]u8 {
+    fn readConfig(self: *ScratchConfigFixture) ![]u8 {
         return self.tmp.dir.readFileAlloc(test_io, "config.json", self.allocator, .limited(64 * 1024));
     }
 };
 
-fn makeHelperConfigFixture(allocator: std.mem.Allocator) !HelperConfigFixture {
+fn makeScratchConfigFixture(allocator: std.mem.Allocator) !ScratchConfigFixture {
     const saved_key_env = testEnviron().getAlloc(allocator, env_name) catch null;
     const saved_config_env = testEnviron().getAlloc(allocator, config_env_name) catch null;
     clearEnv();
@@ -12307,7 +12317,7 @@ fn makeHelperConfigFixture(allocator: std.mem.Allocator) !HelperConfigFixture {
 test "config set credential_helper stores a helper that returns a usable key" {
     const allocator = std.testing.allocator;
 
-    var fixture = try makeHelperConfigFixture(allocator);
+    var fixture = try makeScratchConfigFixture(allocator);
     defer fixture.deinit();
 
     var fake = FakeProcess{
@@ -12358,7 +12368,7 @@ test "config set credential_helper stores a helper that returns a usable key" {
 test "config set credential_helper splits with no shell semantics" {
     const allocator = std.testing.allocator;
 
-    var fixture = try makeHelperConfigFixture(allocator);
+    var fixture = try makeScratchConfigFixture(allocator);
     defer fixture.deinit();
 
     var fake = FakeProcess{
@@ -12388,7 +12398,7 @@ test "config set credential_helper splits with no shell semantics" {
 test "config set credential_helper refuses a helper that fails" {
     const allocator = std.testing.allocator;
 
-    var fixture = try makeHelperConfigFixture(allocator);
+    var fixture = try makeScratchConfigFixture(allocator);
     defer fixture.deinit();
 
     var fake = FakeProcess{
@@ -12437,7 +12447,7 @@ test "config set credential_helper refuses a helper that produces nothing usable
     };
 
     for (cases) |case| {
-        var fixture = try makeHelperConfigFixture(allocator);
+        var fixture = try makeScratchConfigFixture(allocator);
         defer fixture.deinit();
 
         var script = [_]FakeProcess.Step{case.step};
@@ -12467,7 +12477,7 @@ test "config set credential_helper refuses a helper that produces nothing usable
 test "config set credential_helper enforces the argv bounds before spawning" {
     const allocator = std.testing.allocator;
 
-    var fixture = try makeHelperConfigFixture(allocator);
+    var fixture = try makeScratchConfigFixture(allocator);
     defer fixture.deinit();
 
     var fake = FakeProcess{ .allocator = allocator, .script = &.{} };
@@ -12495,7 +12505,7 @@ test "config set credential_helper enforces the argv bounds before spawning" {
 test "config set credential_helper refuses an over-long argument before spawning" {
     const allocator = std.testing.allocator;
 
-    var fixture = try makeHelperConfigFixture(allocator);
+    var fixture = try makeScratchConfigFixture(allocator);
     defer fixture.deinit();
 
     var fake = FakeProcess{ .allocator = allocator, .script = &.{} };
@@ -12526,7 +12536,7 @@ test "config set credential_helper refuses an over-long argument before spawning
 test "config set credential_helper refuses when process execution is unavailable" {
     const allocator = std.testing.allocator;
 
-    var fixture = try makeHelperConfigFixture(allocator);
+    var fixture = try makeScratchConfigFixture(allocator);
     defer fixture.deinit();
 
     // No runner: the helper cannot be verified, so it must not be stored on the
@@ -12548,7 +12558,7 @@ test "config set credential_helper refuses when process execution is unavailable
 test "config unset credential_helper remains the escape hatch" {
     const allocator = std.testing.allocator;
 
-    var fixture = try makeHelperConfigFixture(allocator);
+    var fixture = try makeScratchConfigFixture(allocator);
     defer fixture.deinit();
 
     var fake = FakeProcess{
@@ -12595,42 +12605,6 @@ test "config set usage documents credential_helper as settable" {
     try std.testing.expect(std.mem.indexOf(u8, text, "Read-only here") == null);
     try std.testing.expect(std.mem.indexOf(u8, text, "NO shell") != null);
     try std.testing.expect(std.mem.indexOf(u8, text, "unset credential_helper") != null);
-}
-
-// ---------------------------------------------------------------------------
-// Scrubbing the plaintext key off disk
-// ---------------------------------------------------------------------------
-
-test "config scrubFile overwrites the bytes it is pointed at" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try tmp.dir.realPathFileAlloc(test_io, ".", allocator);
-    defer allocator.free(dir_path);
-    const path = try std.fs.path.join(allocator, &.{ dir_path, "secret.json" });
-    defer allocator.free(path);
-
-    try tmp.dir.writeFile(test_io, .{ .sub_path = "secret.json", .data = "{\"api_key\":\"" ++ fake_file_key ++ "\"}" });
-    try config.scrubFile(test_io, path);
-
-    const after = try tmp.dir.readFileAlloc(test_io, "secret.json", allocator, .limited(4096));
-    defer allocator.free(after);
-    try std.testing.expect(std.mem.indexOf(u8, after, fake_file_key) == null);
-    for (after) |byte| try std.testing.expectEqual(@as(u8, 0), byte);
-}
-
-test "config scrubFile tolerates a missing file" {
-    const allocator = std.testing.allocator;
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    const dir_path = try tmp.dir.realPathFileAlloc(test_io, ".", allocator);
-    defer allocator.free(dir_path);
-    const path = try std.fs.path.join(allocator, &.{ dir_path, "absent.json" });
-    defer allocator.free(path);
-
-    try config.scrubFile(test_io, path);
 }
 
 // ---------------------------------------------------------------------------
@@ -12734,177 +12708,32 @@ test "auth status reports a failed helper as its own state" {
 }
 
 // ---------------------------------------------------------------------------
-// auth migrate
+// auth set --to keychain|file
+//
+// `auth migrate` is gone. It wrote to a backend, read back, compared, and then
+// scrubbed the plaintext copy — and still told the operator to rotate the key,
+// because scrubbing cannot beat copy-on-write, snapshots, or backups. If the
+// key has to be rotated anyway, moving the old one buys nothing over deleting
+// the config file and setting up fresh. What `--to keychain` preserves is the
+// only thing migrate was load-bearing for: a way to reach the keychain backend
+// at all.
 // ---------------------------------------------------------------------------
 
-const MigrateFixture = struct {
-    tmp: std.testing.TmpDir,
-    /// `realPathFileAlloc` returns a sentinel-terminated slice; keeping the
-    /// sentinel in the type is what makes the matching `free` the right size.
-    dir_path: [:0]u8,
-    config_path: []u8,
-    cfg: config.Config,
-    saved_key_env: ?[]u8,
-    saved_config_env: ?[]u8,
-    allocator: std.mem.Allocator,
+/// The key that gets piped into `auth set` in this section. Distinct from the
+/// other fakes so an assertion cannot pass on the wrong one.
+const fake_set_key = "setKEY0123456789xyz";
 
-    fn deinit(self: *MigrateFixture) void {
-        self.cfg.deinit();
-        self.allocator.free(self.config_path);
-        self.allocator.free(self.dir_path);
-        self.tmp.cleanup();
-        restoreEnv(env_name_z, self.saved_key_env, self.allocator);
-        restoreEnv(config_env_name_z, self.saved_config_env, self.allocator);
-    }
-
-    fn readConfig(self: *MigrateFixture) ![]u8 {
-        return self.tmp.dir.readFileAlloc(test_io, "config.json", self.allocator, .limited(64 * 1024));
-    }
-};
-
-/// A config file on disk holding a plaintext `api_key`, which is the state
-/// `auth migrate` exists to get out of.
-fn makeMigrateFixture(allocator: std.mem.Allocator) !MigrateFixture {
-    const saved_key_env = testEnviron().getAlloc(allocator, env_name) catch null;
-    const saved_config_env = testEnviron().getAlloc(allocator, config_env_name) catch null;
-    clearEnv();
-
-    var tmp = std.testing.tmpDir(.{});
-    errdefer tmp.cleanup();
-    const dir_path = try tmp.dir.realPathFileAlloc(test_io, ".", allocator);
-    errdefer allocator.free(dir_path);
-    const config_path = try std.fs.path.join(allocator, &.{ dir_path, "config.json" });
-    errdefer allocator.free(config_path);
-
-    var cfg = try config.load(allocator, test_io, testEnviron(), config_path);
-    errdefer cfg.deinit();
-    try cfg.setApiKey(fake_file_key);
-    try cfg.setDefaultTeamId("ENG");
-    try cfg.save(allocator, config_path);
-
-    return .{
-        .tmp = tmp,
-        .dir_path = dir_path,
-        .config_path = config_path,
-        .cfg = cfg,
-        .saved_key_env = saved_key_env,
-        .saved_config_env = saved_config_env,
-        .allocator = allocator,
-    };
-}
-
-test "auth migrate to a helper verifies the read-back before dropping the plaintext key" {
+test "auth set --to keychain writes through security -i and reads the item back" {
     const allocator = std.testing.allocator;
 
-    var fixture = try makeMigrateFixture(allocator);
-    defer fixture.deinit();
-
-    var fake = FakeProcess{
-        .allocator = allocator,
-        .script = &.{.{ .stdout = fake_file_key ++ "\n" }},
-    };
-    defer fake.deinit();
-
-    const runner = AuthRunner{
-        .allocator = allocator,
-        .cfg = &fixture.cfg,
-        .args = &.{ "migrate", "--to", "helper", "op", "read", "op://Private/Linear/api-key" },
-        .config_path = fixture.config_path,
-        .credential_runner = fake.runner(),
-    };
-    const capture = try captureOutput(allocator, &runner, runAuth);
-    defer capture.deinit(allocator);
-
-    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "migrated to credential_helper") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, fake_file_key) == null);
-    try expectCall(&fake, 0, &.{ "op", "read", "op://Private/Linear/api-key" });
-
-    const written = try fixture.readConfig();
-    defer allocator.free(written);
-    try std.testing.expect(std.mem.indexOf(u8, written, fake_file_key) == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "\"api_key\"") == null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "credential_helper") != null);
-    // Unrelated settings survive the rewrite.
-    try std.testing.expect(std.mem.indexOf(u8, written, "ENG") != null);
-}
-
-test "auth migrate keeps the plaintext key when the helper hands back a different one" {
-    const allocator = std.testing.allocator;
-
-    var fixture = try makeMigrateFixture(allocator);
-    defer fixture.deinit();
-
-    var fake = FakeProcess{
-        .allocator = allocator,
-        .script = &.{.{ .stdout = fake_helper_key ++ "\n" }},
-    };
-    defer fake.deinit();
-
-    const runner = AuthRunner{
-        .allocator = allocator,
-        .cfg = &fixture.cfg,
-        .args = &.{ "migrate", "--to", "helper", "op", "read", "op://Private/Linear/api-key" },
-        .config_path = fixture.config_path,
-        .credential_runner = fake.runner(),
-    };
-    const capture = try captureOutput(allocator, &runner, runAuth);
-    defer capture.deinit(allocator);
-
-    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "different key") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, fake_file_key) == null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, fake_helper_key) == null);
-
-    // Nothing was written: the key on disk is still the only copy there is.
-    const written = try fixture.readConfig();
-    defer allocator.free(written);
-    try std.testing.expect(std.mem.indexOf(u8, written, fake_file_key) != null);
-    try std.testing.expect(std.mem.indexOf(u8, written, "credential_helper") == null);
-    try std.testing.expect(fixture.cfg.credential_helper == null);
-}
-
-test "auth migrate keeps the plaintext key when the helper fails outright" {
-    const allocator = std.testing.allocator;
-
-    var fixture = try makeMigrateFixture(allocator);
-    defer fixture.deinit();
-
-    var fake = FakeProcess{
-        .allocator = allocator,
-        .script = &.{.{ .fail = git.Error.BinaryNotFound }},
-    };
-    defer fake.deinit();
-
-    const runner = AuthRunner{
-        .allocator = allocator,
-        .cfg = &fixture.cfg,
-        .args = &.{ "migrate", "--to", "helper", "op", "read", "op://Private/Linear/api-key" },
-        .config_path = fixture.config_path,
-        .credential_runner = fake.runner(),
-    };
-    const capture = try captureOutput(allocator, &runner, runAuth);
-    defer capture.deinit(allocator);
-
-    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "was not found on PATH") != null);
-
-    const written = try fixture.readConfig();
-    defer allocator.free(written);
-    try std.testing.expect(std.mem.indexOf(u8, written, fake_file_key) != null);
-}
-
-test "auth migrate to the keychain writes, reads back, then removes the plaintext key" {
-    const allocator = std.testing.allocator;
-
-    var fixture = try makeMigrateFixture(allocator);
+    var fixture = try makeScratchConfigFixture(allocator);
     defer fixture.deinit();
 
     var fake = FakeProcess{
         .allocator = allocator,
         .script = &.{
             .{}, // security -i
-            .{ .stdout = fake_file_key ++ "\n" }, // find-generic-password -w
+            .{ .stdout = fake_set_key ++ "\n" }, // find-generic-password -w
         },
     };
     defer fake.deinit();
@@ -12912,24 +12741,34 @@ test "auth migrate to the keychain writes, reads back, then removes the plaintex
     const runner = AuthRunner{
         .allocator = allocator,
         .cfg = &fixture.cfg,
-        .args = &.{ "migrate", "--to", "keychain" },
+        .args = &.{ "set", "--to", "keychain" },
         .config_path = fixture.config_path,
         .credential_runner = fake.runner(),
     };
-    const capture = try captureOutput(allocator, &runner, runAuth);
+    const capture = try captureOutputWithStdin(allocator, &runner, runAuth, fake_set_key ++ "\n");
     defer capture.deinit(allocator);
 
     if (!credentials.keychain_supported) {
+        // No silent downgrade to the plaintext file on a platform without the
+        // backend: the command refuses and spawns nothing.
         try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
         try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "only available on macOS") != null);
+        try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "credential_helper") != null);
         try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+        const untouched = try fixture.readConfig();
+        defer allocator.free(untouched);
+        try std.testing.expect(std.mem.indexOf(u8, untouched, fake_set_key) == null);
         return;
     }
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "migrated to keychain") != null);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, fake_file_key) == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "stored in the keychain") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, fake_set_key) == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, fake_set_key) == null);
 
+    // The write is the interactive form, so the secret travels on stdin and
+    // appears in no argv — `add-generic-password -w <secret>` would publish it
+    // in the process table.
     try expectCall(&fake, 0, &.{ "/usr/bin/security", "-i" });
     try expectCall(&fake, 1, &.{
         "/usr/bin/security",
@@ -12940,29 +12779,35 @@ test "auth migrate to the keychain writes, reads back, then removes the plaintex
         "-a",
         "api-key",
     });
-    // The secret reached `security` on stdin and appears in no argv.
-    try std.testing.expect(std.mem.indexOf(u8, fake.inputs.items[0], fake_file_key) != null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.calls.items[0], fake_file_key) == null);
-    try std.testing.expect(std.mem.indexOf(u8, fake.calls.items[1], fake_file_key) == null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.inputs.items[0], fake_set_key) != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.calls.items[0], fake_set_key) == null);
+    try std.testing.expect(std.mem.indexOf(u8, fake.calls.items[1], fake_set_key) == null);
 
+    // The keychain path never touches the config file.
     const written = try fixture.readConfig();
     defer allocator.free(written);
-    try std.testing.expect(std.mem.indexOf(u8, written, fake_file_key) == null);
+    try std.testing.expect(std.mem.indexOf(u8, written, fake_set_key) == null);
     try std.testing.expect(std.mem.indexOf(u8, written, "\"api_key\"") == null);
+    // Nothing to warn about: there was no plaintext key to leave behind.
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "plaintext api_key is still") == null);
 }
 
-test "auth migrate to the keychain aborts when the read-back disagrees" {
+test "auth set --to keychain says the plaintext key is still on disk" {
     const allocator = std.testing.allocator;
     if (!credentials.keychain_supported) return error.SkipZigTest;
 
-    var fixture = try makeMigrateFixture(allocator);
+    var fixture = try makeScratchConfigFixture(allocator);
     defer fixture.deinit();
+    // The state that used to be `auth migrate`'s input: a plaintext key already
+    // in the config file.
+    try fixture.cfg.setApiKey(fake_file_key);
+    try fixture.cfg.save(allocator, fixture.config_path);
 
     var fake = FakeProcess{
         .allocator = allocator,
         .script = &.{
-            .{}, // the write claims success
-            .{ .stdout = fake_keychain_key ++ "\n" }, // but a different item comes back
+            .{},
+            .{ .stdout = fake_set_key ++ "\n" },
         },
     };
     defer fake.deinit();
@@ -12970,28 +12815,37 @@ test "auth migrate to the keychain aborts when the read-back disagrees" {
     const runner = AuthRunner{
         .allocator = allocator,
         .cfg = &fixture.cfg,
-        .args = &.{ "migrate", "--to", "keychain" },
+        .args = &.{ "set", "--to", "keychain" },
         .config_path = fixture.config_path,
         .credential_runner = fake.runner(),
     };
-    const capture = try captureOutput(allocator, &runner, runAuth);
+    const capture = try captureOutputWithStdin(allocator, &runner, runAuth, fake_set_key ++ "\n");
     defer capture.deinit(allocator);
 
-    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "read back a different key") != null);
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // The keychain outranks the file, so the old key is no longer in use and is
+    // easy to forget. The command says so instead of scrubbing it: deleting the
+    // file is the operator's call, and the key must be rotated either way.
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "plaintext api_key is still") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "team_cache") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "rotate") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, fake_file_key) == null);
 
+    // And it really did leave the file alone rather than half-scrubbing it.
     const written = try fixture.readConfig();
     defer allocator.free(written);
     try std.testing.expect(std.mem.indexOf(u8, written, fake_file_key) != null);
 }
 
-test "auth migrate to the keychain aborts when the item cannot be read back" {
+test "auth set --to keychain refuses to claim success it cannot read back" {
     const allocator = std.testing.allocator;
     if (!credentials.keychain_supported) return error.SkipZigTest;
 
-    var fixture = try makeMigrateFixture(allocator);
+    var fixture = try makeScratchConfigFixture(allocator);
     defer fixture.deinit();
 
+    // `security -i` reports on the session, not on each command it was fed, so
+    // an exit-0 write that stored nothing must not read as success.
     var fake = FakeProcess{
         .allocator = allocator,
         .script = &.{
@@ -13004,149 +12858,157 @@ test "auth migrate to the keychain aborts when the item cannot be read back" {
     const runner = AuthRunner{
         .allocator = allocator,
         .cfg = &fixture.cfg,
-        .args = &.{ "migrate", "--to", "keychain" },
+        .args = &.{ "set", "--to", "keychain" },
         .config_path = fixture.config_path,
         .credential_runner = fake.runner(),
     };
-    const capture = try captureOutput(allocator, &runner, runAuth);
+    const capture = try captureOutputWithStdin(allocator, &runner, runAuth, fake_set_key ++ "\n");
     defer capture.deinit(allocator);
 
     try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
     try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "could not be read back") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, fake_set_key) == null);
+    try std.testing.expectEqualStrings("", capture.stdout);
+}
 
+test "auth set --to file stays the default and writes the plaintext config file" {
+    const allocator = std.testing.allocator;
+
+    var fixture = try makeScratchConfigFixture(allocator);
+    defer fixture.deinit();
+
+    // An empty script proves the file backend spawns nothing: no `security`, no
+    // helper, just the write.
+    var fake = FakeProcess{ .allocator = allocator, .script = &.{} };
+    defer fake.deinit();
+
+    const runner = AuthRunner{
+        .allocator = allocator,
+        .cfg = &fixture.cfg,
+        .args = &.{ "set", "--to", "file" },
+        .config_path = fixture.config_path,
+        .credential_runner = fake.runner(),
+    };
+    const capture = try captureOutputWithStdin(allocator, &runner, runAuth, fake_set_key ++ "\n");
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stdout, "api key saved") != null);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+
+    var reloaded = try config.load(allocator, test_io, testEnviron(), fixture.config_path);
+    defer reloaded.deinit();
+    try std.testing.expectEqualStrings(fake_set_key, reloaded.api_key.?);
+    try std.testing.expectEqual(config.KeySource.file, reloaded.key_source);
+}
+
+test "auth set --to rejects a backend it does not have" {
+    const allocator = std.testing.allocator;
+
+    var fixture = try makeScratchConfigFixture(allocator);
+    defer fixture.deinit();
+
+    var fake = FakeProcess{ .allocator = allocator, .script = &.{} };
+    defer fake.deinit();
+
+    const runner = AuthRunner{
+        .allocator = allocator,
+        .cfg = &fixture.cfg,
+        .args = &.{ "set", "--to", "vault" },
+        .config_path = fixture.config_path,
+        .credential_runner = fake.runner(),
+    };
+    const capture = try captureOutputWithStdin(allocator, &runner, runAuth, fake_set_key ++ "\n");
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "UnknownBackend") != null);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+
+    // Rejected before anything is stored anywhere.
+    const written = try fixture.readConfig();
+    defer allocator.free(written);
+    try std.testing.expect(std.mem.indexOf(u8, written, fake_set_key) == null);
+}
+
+test "auth set flag parsing defaults to file and rejects malformed --to" {
+    const empty: [][]const u8 = &.{};
+    const parsed_empty = try auth_cmd.parseSetOptions(empty);
+    try std.testing.expectEqual(auth_cmd.SetTarget.file, parsed_empty.target);
+
+    var to_file = [_][]const u8{ "--to", "file" };
+    try std.testing.expectEqual(auth_cmd.SetTarget.file, (try auth_cmd.parseSetOptions(to_file[0..])).target);
+
+    var to_keychain = [_][]const u8{ "--to", "keychain" };
+    try std.testing.expectEqual(auth_cmd.SetTarget.keychain, (try auth_cmd.parseSetOptions(to_keychain[0..])).target);
+
+    var bad_backend = [_][]const u8{ "--to", "helper" };
+    try std.testing.expectError(error.UnknownBackend, auth_cmd.parseSetOptions(bad_backend[0..]));
+
+    var missing = [_][]const u8{"--to"};
+    try std.testing.expectError(error.MissingValue, auth_cmd.parseSetOptions(missing[0..]));
+
+    // Still no way to hand a key in on argv.
+    var api_key_flag = [_][]const u8{ "--api-key", "whatever" };
+    try std.testing.expectError(error.UnknownFlag, auth_cmd.parseSetOptions(api_key_flag[0..]));
+
+    var stray = [_][]const u8{"keychain"};
+    try std.testing.expectError(error.UnexpectedArgument, auth_cmd.parseSetOptions(stray[0..]));
+}
+
+test "auth migrate is no longer a subcommand" {
+    const allocator = std.testing.allocator;
+
+    var fixture = try makeScratchConfigFixture(allocator);
+    defer fixture.deinit();
+    try fixture.cfg.setApiKey(fake_file_key);
+    try fixture.cfg.save(allocator, fixture.config_path);
+
+    var fake = FakeProcess{ .allocator = allocator, .script = &.{} };
+    defer fake.deinit();
+
+    const runner = AuthRunner{
+        .allocator = allocator,
+        .cfg = &fixture.cfg,
+        .args = &.{ "migrate", "--to", "keychain" },
+        .config_path = fixture.config_path,
+        .credential_runner = fake.runner(),
+    };
+    const capture = try captureOutputWithStdin(allocator, &runner, runAuth, "");
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "unknown command: migrate") != null);
+    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
+
+    // The usage it falls back to must not advertise the removed command either.
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "auth migrate") == null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "--to keychain") != null);
+
+    // Nothing was moved, scrubbed, or rewritten.
     const written = try fixture.readConfig();
     defer allocator.free(written);
     try std.testing.expect(std.mem.indexOf(u8, written, fake_file_key) != null);
 }
 
-test "auth migrate refuses to pick a backend on its own" {
+test "auth usage no longer offers migrate anywhere" {
     const allocator = std.testing.allocator;
 
-    var fixture = try makeMigrateFixture(allocator);
-    defer fixture.deinit();
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer buffer.deinit();
+    try auth_cmd.usage(&buffer.writer);
+    try auth_cmd.setUsage(&buffer.writer);
 
-    var fake = FakeProcess{ .allocator = allocator, .script = &.{} };
-    defer fake.deinit();
-
-    const runner = AuthRunner{
-        .allocator = allocator,
-        .cfg = &fixture.cfg,
-        .args = &.{"migrate"},
-        .config_path = fixture.config_path,
-        .credential_runner = fake.runner(),
-    };
-    const capture = try captureOutput(allocator, &runner, runAuth);
-    defer capture.deinit(allocator);
-
-    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "missing --to") != null);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
-}
-
-test "auth migrate needs a command for the helper backend" {
-    const allocator = std.testing.allocator;
-
-    var fixture = try makeMigrateFixture(allocator);
-    defer fixture.deinit();
-
-    var fake = FakeProcess{ .allocator = allocator, .script = &.{} };
-    defer fake.deinit();
-
-    const runner = AuthRunner{
-        .allocator = allocator,
-        .cfg = &fixture.cfg,
-        .args = &.{ "migrate", "--to", "helper" },
-        .config_path = fixture.config_path,
-        .credential_runner = fake.runner(),
-    };
-    const capture = try captureOutput(allocator, &runner, runAuth);
-    defer capture.deinit(allocator);
-
-    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "needs the command") != null);
-}
-
-test "auth migrate has nothing to do when the file holds no key" {
-    const allocator = std.testing.allocator;
-    const previous = testEnviron().getAlloc(allocator, env_name) catch null;
-    const previous_config = testEnviron().getAlloc(allocator, config_env_name) catch null;
-    defer {
-        restoreEnv(env_name_z, previous, allocator);
-        restoreEnv(config_env_name_z, previous_config, allocator);
-    }
-    clearEnv();
-    try setEnvValue(fake_env_key, allocator);
-
-    var cfg = try makeChainConfig(allocator, null);
-    defer cfg.deinit();
-    try cfg.applyEnvOverrides();
-    try std.testing.expectEqual(config.KeySource.environment, cfg.key_source);
-
-    var fake = FakeProcess{ .allocator = allocator, .script = &.{} };
-    defer fake.deinit();
-
-    const runner = AuthRunner{
-        .allocator = allocator,
-        .cfg = &cfg,
-        .args = &.{ "migrate", "--to", "keychain" },
-        .credential_runner = fake.runner(),
-    };
-    const capture = try captureOutput(allocator, &runner, runAuth);
-    defer capture.deinit(allocator);
-
-    // An environment key is not ours to move, and it never reached the file.
-    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "no API key in the config file") != null);
-    try std.testing.expectEqual(@as(usize, 0), fake.calls.items.len);
-}
-
-test "auth migrate splits a single quoted helper command on whitespace" {
-    const allocator = std.testing.allocator;
-
-    var fixture = try makeMigrateFixture(allocator);
-    defer fixture.deinit();
-
-    var fake = FakeProcess{
-        .allocator = allocator,
-        .script = &.{.{ .stdout = fake_file_key ++ "\n" }},
-    };
-    defer fake.deinit();
-
-    const runner = AuthRunner{
-        .allocator = allocator,
-        .cfg = &fixture.cfg,
-        .args = &.{ "migrate", "--to", "helper", "pass show linear/api-key" },
-        .config_path = fixture.config_path,
-        .credential_runner = fake.runner(),
-    };
-    const capture = try captureOutput(allocator, &runner, runAuth);
-    defer capture.deinit(allocator);
-
-    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
-    try expectCall(&fake, 0, &.{ "pass", "show", "linear/api-key" });
-}
-
-test "auth migrate flag parsing rejects unknown backends and flags" {
-    const empty: [][]const u8 = &.{};
-    const parsed_empty = try auth_cmd.parseMigrateOptions(empty);
-    try std.testing.expect(parsed_empty.target == null);
-
-    var bad_backend = [_][]const u8{ "--to", "vault" };
-    try std.testing.expectError(error.UnknownBackend, auth_cmd.parseMigrateOptions(bad_backend[0..]));
-
-    var missing = [_][]const u8{"--to"};
-    try std.testing.expectError(error.MissingValue, auth_cmd.parseMigrateOptions(missing[0..]));
-
-    var unknown = [_][]const u8{"--force"};
-    try std.testing.expectError(error.UnknownFlag, auth_cmd.parseMigrateOptions(unknown[0..]));
-
-    // Everything after `--to helper` is argv, including things that look like
-    // flags: a helper may legitimately need `--field password`.
-    var helper = [_][]const u8{ "--to", "helper", "op", "item", "get", "--fields", "password" };
-    const parsed = try auth_cmd.parseMigrateOptions(helper[0..]);
-    try std.testing.expectEqual(auth_cmd.MigrateTarget.helper, parsed.target.?);
-    try std.testing.expectEqual(@as(usize, 5), parsed.helper_argv.len);
-    try std.testing.expectEqualStrings("--fields", parsed.helper_argv[3]);
+    const text = buffer.written();
+    try std.testing.expect(std.mem.indexOf(u8, text, "migrate") == null);
+    // And the replacement story is what it offers instead.
+    try std.testing.expect(std.mem.indexOf(u8, text, "--to keychain") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "--to file") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "config set credential_helper") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "~/.config/linear/config.json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "team_cache") != null);
+    // Keys never arrive on argv, so no usage line may suggest they can.
+    try std.testing.expect(std.mem.indexOf(u8, text, "--api-key") == null);
 }
 
 test "issues list --sort sends sort without orderBy" {
