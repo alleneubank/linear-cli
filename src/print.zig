@@ -10,6 +10,28 @@ pub const IssueField = enum { identifier, title, state, assignee, priority, upda
 pub const issue_default_fields = [_]IssueField{ .identifier, .title, .state, .assignee, .priority, .updated };
 pub const issue_field_count = std.meta.fields(IssueField).len;
 
+/// Resolves a user-supplied issue column name: the enum tags matched
+/// case-insensitively, plus the three aliases the flag shipped with (`id`,
+/// `subIssues`, `updatedAt`). Unknown names return null so the caller can reject
+/// them locally instead of sending a request that cannot be rendered.
+///
+/// It lives beside the enum rather than inside `issues list` because
+/// `search --fields` validates the same vocabulary, and a second copy of the
+/// alias set would drift from this one.
+pub fn parseIssueField(name: []const u8) ?IssueField {
+    if (std.ascii.eqlIgnoreCase(name, "identifier") or std.ascii.eqlIgnoreCase(name, "id")) return .identifier;
+    if (std.ascii.eqlIgnoreCase(name, "title")) return .title;
+    if (std.ascii.eqlIgnoreCase(name, "state")) return .state;
+    if (std.ascii.eqlIgnoreCase(name, "assignee")) return .assignee;
+    if (std.ascii.eqlIgnoreCase(name, "priority")) return .priority;
+    if (std.ascii.eqlIgnoreCase(name, "parent")) return .parent;
+    if (std.ascii.eqlIgnoreCase(name, "sub_issues") or std.ascii.eqlIgnoreCase(name, "subIssues")) return .sub_issues;
+    if (std.ascii.eqlIgnoreCase(name, "project")) return .project;
+    if (std.ascii.eqlIgnoreCase(name, "milestone")) return .milestone;
+    if (std.ascii.eqlIgnoreCase(name, "updated") or std.ascii.eqlIgnoreCase(name, "updatedAt")) return .updated;
+    return null;
+}
+
 pub const TeamField = enum { id, key, name };
 pub const team_default_fields = [_]TeamField{ .id, .key, .name };
 pub const team_field_count = team_default_fields.len;

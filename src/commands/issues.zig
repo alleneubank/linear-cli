@@ -1444,7 +1444,7 @@ fn parseIssueFields(raw: ?[]const u8, buffer: *std.ArrayListUnmanaged(printer.Is
         while (iter.next()) |field_raw| {
             const trimmed = std.mem.trim(u8, field_raw, " \t");
             if (trimmed.len == 0) continue;
-            const field = parseIssueFieldName(trimmed) orelse return error.InvalidField;
+            const field = printer.parseIssueField(trimmed) orelse return error.InvalidField;
             if (!containsIssueField(buffer.items, field)) {
                 try buffer.append(allocator, field);
             }
@@ -1454,20 +1454,6 @@ fn parseIssueFields(raw: ?[]const u8, buffer: *std.ArrayListUnmanaged(printer.Is
     }
     try buffer.appendSlice(allocator, printer.issue_default_fields[0..]);
     return buffer.items;
-}
-
-fn parseIssueFieldName(name: []const u8) ?printer.IssueField {
-    if (std.ascii.eqlIgnoreCase(name, "identifier") or std.ascii.eqlIgnoreCase(name, "id")) return .identifier;
-    if (std.ascii.eqlIgnoreCase(name, "title")) return .title;
-    if (std.ascii.eqlIgnoreCase(name, "state")) return .state;
-    if (std.ascii.eqlIgnoreCase(name, "assignee")) return .assignee;
-    if (std.ascii.eqlIgnoreCase(name, "priority")) return .priority;
-    if (std.ascii.eqlIgnoreCase(name, "parent")) return .parent;
-    if (std.ascii.eqlIgnoreCase(name, "sub_issues") or std.ascii.eqlIgnoreCase(name, "subIssues")) return .sub_issues;
-    if (std.ascii.eqlIgnoreCase(name, "project")) return .project;
-    if (std.ascii.eqlIgnoreCase(name, "milestone")) return .milestone;
-    if (std.ascii.eqlIgnoreCase(name, "updated") or std.ascii.eqlIgnoreCase(name, "updatedAt")) return .updated;
-    return null;
 }
 
 fn containsIssueField(haystack: []const printer.IssueField, needle: printer.IssueField) bool {

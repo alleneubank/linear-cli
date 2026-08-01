@@ -806,8 +806,13 @@ test "parse search options" {
         "agent",
         "--team",
         "ENG",
+        // The two field flags are separate options: `--search-fields` picks the
+        // haystack, `--fields` the printed columns, and neither may capture the
+        // other's value.
+        "--search-fields",
+        "title,comments",
         "--fields",
-        "title,comments,identifier",
+        "identifier,title",
         "--state-type",
         "backlog,started",
         "--assignee",
@@ -819,7 +824,8 @@ test "parse search options" {
     const opts = try search_cmd.parseOptions(args[0..]);
     try std.testing.expectEqualStrings("agent", opts.query.?);
     try std.testing.expectEqualStrings("ENG", opts.team.?);
-    try std.testing.expectEqualStrings("title,comments,identifier", opts.fields.?);
+    try std.testing.expectEqualStrings("title,comments", opts.search_fields.?);
+    try std.testing.expectEqualStrings("identifier,title", opts.fields.?);
     try std.testing.expectEqualStrings("backlog,started", opts.state_type.?);
     try std.testing.expectEqualStrings("user-1", opts.assignee.?);
     try std.testing.expectEqual(@as(usize, 10), opts.limit);
@@ -1596,7 +1602,7 @@ test "search renders table and reports the resume cursor with mock graphql" {
     try std.testing.expectEqual(@as(usize, 1), server.request_count);
 }
 
-test "search builds filters for selected fields" {
+test "search builds filters for selected search fields" {
     const allocator = std.testing.allocator;
 
     var server = mock_graphql.MockServer.init(allocator);
@@ -1619,7 +1625,7 @@ test "search builds filters for selected fields" {
                 "Agent",
                 "--team",
                 "TEAM",
-                "--fields",
+                "--search-fields",
                 "title,comments",
                 "--state-type",
                 "backlog,started",
@@ -1918,8 +1924,8 @@ test "search data-only emits tab-separated rows" {
     defer capture.deinit(allocator);
 
     try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
-    // The fixed `issue_default_fields` projection, then the url — the same
-    // record `issues list --data-only` writes.
+    // The default projection (all six columns `search` fetches), then the url --
+    // the same record `issues list --data-only` writes.
     try std.testing.expectEqualStrings(
         "LIN-101\tFirst offline issue\tTodo\tAda Lovelace\tHigh\t2024-05-10T12:00:00Z\thttps://linear.app/example/issue/1\n" ++
             "LIN-102\tSecond offline issue\tIn Progress\tGrace Hopper\tMedium\t2024-05-11T15:30:00Z\thttps://linear.app/example/issue/2\n",
@@ -2019,6 +2025,371 @@ test "parse search pagination and output options" {
 
     const zero_pages = [_][]const u8{ "agent", "--pages", "0" };
     try std.testing.expectError(error.InvalidPageCount, search_cmd.parseOptions(zero_pages[0..]));
+}
+
+/// The keys of `filter.or` on the last recorded `SearchIssues` request, in
+/// order. That array *is* the search scope, so every test that cares which
+/// fields were searched asserts on it rather than on the printed rows.
+fn expectSearchClauses(
+    allocator: std.mem.Allocator,
+    server: *mock_graphql.MockServer,
+    expected: []const []const u8,
+) !void {
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars_json = recorded.variables_json orelse return error.TestExpectedResult;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, vars_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.TestExpectedResult;
+    const filter = parsed.value.object.get("filter") orelse return error.TestExpectedResult;
+    if (filter != .object) return error.TestExpectedResult;
+    const or_value = filter.object.get("or") orelse return error.TestExpectedResult;
+    if (or_value != .array) return error.TestExpectedResult;
+    try std.testing.expectEqual(expected.len, or_value.array.items.len);
+    for (expected, or_value.array.items) |want, clause| {
+        if (clause != .object) return error.TestExpectedResult;
+        try std.testing.expectEqual(@as(usize, 1), clause.object.count());
+        var iter = clause.object.iterator();
+        const entry = iter.next() orelse return error.TestExpectedResult;
+        try std.testing.expectEqualStrings(want, entry.key_ptr.*);
+    }
+}
+
+test "search --search-fields narrows the haystack without touching the columns" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    // What `--fields` meant before the split: search comment bodies only.
+    var args = [_][]const u8{ "offline", "--search-fields", "comments" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try expectSearchClauses(allocator, &server, &.{"comments"});
+    // The printed table is untouched by the search scope: still the default six.
+    try std.testing.expectEqualStrings(fixtures.issues_table, capture.stdout);
+}
+
+test "search --fields projects printed columns and leaves the haystack alone" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "offline", "--fields", "identifier,title", "--data-only" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // Two selected columns, then the url — the same record shape
+    // `issues list --fields identifier,title --data-only` writes.
+    try std.testing.expectEqualStrings(
+        "LIN-101\tFirst offline issue\thttps://linear.app/example/issue/1\n" ++
+            "LIN-102\tSecond offline issue\thttps://linear.app/example/issue/2\n",
+        capture.stdout,
+    );
+    // A print projection must not reach the query: the default scope stands.
+    try expectSearchClauses(allocator, &server, &.{ "title", "description" });
+}
+
+test "search --fields reorders and drops table columns" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "offline", "--fields", "state,identifier", "--plain" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings(
+        "State  Identifier\n" ++
+            "Todo  LIN-101\n" ++
+            "In Progress  LIN-102\n",
+        capture.stdout,
+    );
+}
+
+test "search accepts both field flags at once" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "offline", "--search-fields", "description", "--fields", "identifier", "--data-only" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try expectSearchClauses(allocator, &server, &.{"description"});
+    try std.testing.expectEqualStrings(
+        "LIN-101\thttps://linear.app/example/issue/1\n" ++
+            "LIN-102\thttps://linear.app/example/issue/2\n",
+        capture.stdout,
+    );
+    // Nothing ambiguous about this invocation, so no reinterpretation hint.
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "selects printed columns") == null);
+}
+
+test "search rejects search-only values in --fields with a pointer to --search-fields" {
+    const allocator = std.testing.allocator;
+
+    // `description` and `comments` are the whole search vocabulary that is not
+    // also a column; both have to point at the other flag rather than read like
+    // a typo.
+    const cases = [_]struct { token: []const u8, expected: []const u8 }{
+        .{
+            .token = "comments",
+            .expected = "search: --fields selects printed columns; 'comments' names a search target -- use --search-fields comments\n" ++
+                "search: search-only values: description, comments; valid --fields values: identifier, title, state, assignee, priority, updated\n",
+        },
+        .{
+            .token = "description",
+            .expected = "search: --fields selects printed columns; 'description' names a search target -- use --search-fields description\n" ++
+                "search: search-only values: description, comments; valid --fields values: identifier, title, state, assignee, priority, updated\n",
+        },
+    };
+
+    for (cases) |case| {
+        var server = mock_graphql.MockServer.init(allocator);
+        defer server.deinit();
+        var scope = mock_graphql.useServer(&server);
+        defer scope.restore();
+        try server.set("SearchIssues", fixtures.issues_response);
+
+        var cfg = try makeTestConfig(allocator);
+        defer cfg.deinit();
+
+        var args = [_][]const u8{ "offline", "--fields", case.token };
+        const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+        const capture = try captureOutput(allocator, &runner, runSearchArgs);
+        defer capture.deinit(allocator);
+
+        try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+        try std.testing.expectEqualStrings("", capture.stdout);
+        try std.testing.expectEqualStrings(case.expected, capture.stderr);
+        // Rejected locally: a mis-aimed value costs no request.
+        try std.testing.expectEqual(@as(usize, 0), server.request_count);
+    }
+}
+
+test "search rejects columns it never fetches" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    // A real `issues list` column, but the SearchIssues selection set has no
+    // project on it — an empty column would read as "no issue has a project".
+    var args = [_][]const u8{ "offline", "--fields", "identifier,project" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expectEqualStrings(
+        "search: --fields 'project' is not fetched by search -- use `issues list --fields project`\n" ++
+            "search: valid --fields values: identifier, title, state, assignee, priority, updated\n",
+        capture.stderr,
+    );
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+}
+
+test "search rejects unknown values in either field vocabulary" {
+    const allocator = std.testing.allocator;
+
+    const cases = [_]struct { flag: []const u8, expected: []const u8 }{
+        .{
+            .flag = "--fields",
+            .expected = "search: invalid --fields value 'bogus'\n" ++
+                "search: valid --fields values: identifier, title, state, assignee, priority, updated\n",
+        },
+        .{
+            // `identifier` is a column, never a search target: the identifier
+            // clause is added from the query text, not from this flag.
+            .flag = "--search-fields",
+            .expected = "search: invalid --search-fields value 'bogus'\n" ++
+                "search: valid --search-fields values: title, description, comments (default: title, description)\n",
+        },
+    };
+
+    for (cases) |case| {
+        var server = mock_graphql.MockServer.init(allocator);
+        defer server.deinit();
+        var scope = mock_graphql.useServer(&server);
+        defer scope.restore();
+        try server.set("SearchIssues", fixtures.issues_response);
+
+        var cfg = try makeTestConfig(allocator);
+        defer cfg.deinit();
+
+        var args = [_][]const u8{ "offline", case.flag, "bogus" };
+        const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+        const capture = try captureOutput(allocator, &runner, runSearchArgs);
+        defer capture.deinit(allocator);
+
+        try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+        try std.testing.expectEqualStrings(case.expected, capture.stderr);
+        try std.testing.expectEqual(@as(usize, 0), server.request_count);
+    }
+}
+
+test "search rejects identifier as a search field" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{ "offline", "--search-fields", "identifier" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expectEqualStrings(
+        "search: invalid --search-fields value 'identifier'\n" ++
+            "search: valid --search-fields values: title, description, comments (default: title, description)\n",
+        capture.stderr,
+    );
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+}
+
+test "search flags a --fields list that is entirely search targets" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    // `title` is the only name both vocabularies accept, so this is the one
+    // command line whose meaning changed silently. It still runs as a
+    // projection; the reinterpretation is reported on stderr.
+    var args = [_][]const u8{ "offline", "--fields", "title", "--data-only" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expectEqualStrings(
+        "First offline issue\thttps://linear.app/example/issue/1\n" ++
+            "Second offline issue\thttps://linear.app/example/issue/2\n",
+        capture.stdout,
+    );
+    try std.testing.expect(std.mem.startsWith(
+        u8,
+        capture.stderr,
+        "search: --fields title selects printed columns; pass --search-fields title to narrow what is searched (default: title, description)\n",
+    ));
+    // The hint changes nothing about the request.
+    try expectSearchClauses(allocator, &server, &.{ "title", "description" });
+}
+
+test "search stays quiet when --fields mixes in a column that is not a search target" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    // `identifier` is meaningless as a search target, so this list cannot have
+    // been written for the old flag — hinting here would be noise.
+    var args = [_][]const u8{ "offline", "--fields", "identifier,title", "--quiet" };
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "selects printed columns") == null);
+}
+
+test "search with neither field flag keeps the default scope and columns" {
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("SearchIssues", fixtures.issues_response);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    var args = [_][]const u8{"offline"};
+    const runner = SearchRunner{ .allocator = allocator, .cfg = &cfg, .args = args[0..] };
+
+    const capture = try captureOutput(allocator, &runner, runSearchArgs);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+    // Unchanged by the split: title+description searched, six columns printed.
+    try expectSearchClauses(allocator, &server, &.{ "title", "description" });
+    try std.testing.expectEqualStrings(fixtures.issues_table, capture.stdout);
+    try std.testing.expectEqualStrings(
+        "search: fetched 2 items across 1 page; more available, resume with --cursor cursor-2\n",
+        capture.stderr,
+    );
 }
 
 test "issues list renders table and warns about pagination with mock graphql" {

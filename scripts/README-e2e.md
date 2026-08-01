@@ -83,7 +83,10 @@ refused; `gql` mutation without `--yes` refused.
 **read-only** — `me`, `me --json`, `teams list`, `teams list --json`, `labels list`,
 `users list`, `users list --include-inactive`, `states list`, `projects list`,
 `issues list`, `issues list --max-items/--sort/--human-time`, `search`,
-`search --fields title,description,comments`, `issue view`.
+`search --search-fields title,description,comments`, `search --fields identifier,title
+--data-only` (the print projection, column count asserted like `issues list`), `search
+--fields comments` (rejected locally, exit 1, stderr naming `--search-fields`),
+`issue view`.
 
 **output modes** — on both `issues list` and `labels list`: default table (asserted to be
 a table, not JSON), `--json`, `--fields` projection, `--quiet` (asserted to emit only

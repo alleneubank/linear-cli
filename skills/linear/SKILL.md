@@ -67,7 +67,8 @@ when you actually want the files.
 
 | Flag | Available on | Default | Effect |
 |------|--------------|---------|--------|
-| `--fields LIST` | `issues list`, `issue view`, `issue comment list`, `projects list`, `project view`, `teams list`, `labels list`, `users list`, `states list`, `milestone list`, `gql` | command-specific (below) | Projection — print only these fields |
+| `--fields LIST` | `issues list`, `issue view`, `search`, `issue comment list`, `projects list`, `project view`, `teams list`, `labels list`, `users list`, `states list`, `milestone list`, `gql` | command-specific (below) | Projection — print only these fields |
+| `--search-fields LIST` | `search` only | `title,description` | Which fields the query text is matched against — **not** a projection |
 | `--quiet` | `issues list`, `search`, `issue view`, `issue create`, `issue update`, `issue delete`, `issue link`, `issue comment`, `issue comment list`/`update`/`delete`, `issue start`, `project add-issue`/`remove-issue`, `labels list`, `users list`, `states list`, `milestone list`/`view`/`create`/`update`/`delete` | off | Identifiers only, one per line (comment id for `issue comment`, relation id for `issue link`, **bare UUIDs** for the enumeration commands) |
 | `--data-only` | same commands as `--quiet`, plus `gql` | off | Tab-separated rows; with `--json`, bare JSON instead of the wrapped envelope |
 | `--plain` | `issues list`, `search`, `issue comment list`, `projects list`, `teams list`, `labels list`, `users list`, `states list`, `milestone list` | off | No cell padding or truncation |
@@ -126,6 +127,11 @@ Flags that **add** output — only pass them when you need the extra data:
   Default: `id,name,target_date,sort_order`.
 - `issue comment list --fields`: `id`, `author`, `body`, `created_at`, `updated_at`, `parent`, `url`.
   Default: `id,author,created_at,body`.
+- `search --fields`: `identifier`, `title`, `state`, `assignee`, `priority`, `updated` — the columns a
+  search response carries. Default: all six. The other four `issues list` columns (`parent`,
+  `sub_issues`, `project`, `milestone`) are rejected here, not blanked.
+- `search --search-fields` (which fields to **search**, not to print): `title`, `description`,
+  `comments`. Default: `title,description`.
 - `gql --fields`: arbitrary **top-level keys of the response `data` object** — not a fixed vocabulary.
 
 An unknown field name is an error, not a silent skip (`issues list: invalid --fields value`).
@@ -134,25 +140,53 @@ An unknown field name is an error, not a silent skip (`issues list: invalid --fi
 
 Each of these has a plausible-looking wrong command. The wrong one is named on purpose.
 
-### `--fields` means two different things
+### `search` has two field flags: `--search-fields` (haystack) and `--fields` (columns)
 
-- `linear issues list --fields ...` and `linear issue view --fields ...` select which fields to **print**.
-- `linear search --fields ...` selects which fields to **search** — valid values are only
-  `title`, `description`, `comments` (default `title,description`).
+`--fields` means the same thing on every command including `search`: which columns to **print**.
+Choosing what to **search** is a separate flag, `--search-fields`.
 
-**Wrong:** `linear search "auth" --fields identifier,title` → `search: invalid --fields value`.
-**Right:** `linear search "auth" --fields title,comments` (searches titles and comment bodies).
+- `linear search "auth" --search-fields title,comments` — search titles and comment bodies.
+  Values: `title`, `description`, `comments`. Default: `title,description`.
+- `linear search "auth" --fields identifier,title --data-only` — print those two columns.
+  Values: `identifier`, `title`, `state`, `assignee`, `priority`, `updated` (the six columns a
+  search response carries). Default: all six.
 
-### `search` takes the output flags but has no output projection
+`--fields` used to mean the haystack. That meaning moved to `--search-fields` outright; there is
+**no deprecated alias**, and the values that only ever made sense as search targets are rejected
+locally, before any request:
 
-`search` accepts `--plain`, `--no-truncate`, `--quiet`, and `--data-only` with the same meaning they
-have everywhere else. What it does **not** have is a `--fields`-for-output: because `--fields` is
-already spent on choosing the search haystack, the printed table is fixed to the default six columns.
+```
+$ linear search "auth" --fields comments
+search: --fields selects printed columns; 'comments' names a search target -- use --search-fields comments
+search: search-only values: description, comments; valid --fields values: identifier, title, state, assignee, priority, updated
+```
 
-**Wrong:** `linear search "auth" --fields identifier,title --data-only` → `search: invalid --fields value`
-(those are not searchable fields).
-**Right:** `linear search "auth" --quiet` for identifiers, `linear search "auth" --data-only` for the
-fixed tab-separated projection, or `linear issues list --fields ...` when you need to choose columns.
+`title` is the only value both flags accept, so `--fields title` alone cannot be disambiguated. It
+runs as a projection (printing just the title column) and says so once on stderr:
+
+```
+search: --fields title selects printed columns; pass --search-fields title to narrow what is searched (default: title, description)
+```
+
+**Wrong:** `linear search "auth" --fields comments` (that is a search target, not a column).
+**Right:** `linear search "auth" --search-fields comments`, or `--fields identifier,title` when you
+want to choose columns.
+
+### `search --fields` covers six columns, not the ten `issues list` has
+
+`search` fetches `identifier`, `title`, `state`, `assignee`, `priority`, `updated` and nothing else.
+The four remaining `issues list` columns are rejected rather than printed empty, so an absent
+project never looks like an issue without one:
+
+```
+$ linear search "auth" --fields identifier,project
+search: --fields 'project' is not fetched by search -- use `issues list --fields project`
+search: valid --fields values: identifier, title, state, assignee, priority, updated
+```
+
+**Wrong:** `linear search "auth" --fields identifier,project`.
+**Right:** `linear issues list --team KEY --fields identifier,project`, or search first with
+`--quiet` and feed the identifiers to `issue view`.
 
 ### `--state` is a state *type* on `issues list`, a state *name* on `issue update`
 
@@ -616,6 +650,12 @@ linear issues list --team TEAM_KEY --assignee me --limit 20 --sub-limit 0 --quie
 ```bash
 linear search "keyword" --team TEAM_KEY --limit 10
 
+# Widen what is searched (haystack), not what is printed
+linear search "keyword" --team TEAM_KEY --search-fields title,description,comments --limit 10
+
+# Narrow what is printed (columns), exactly as on issues list
+linear search "keyword" --team TEAM_KEY --fields identifier,title --data-only
+
 # Identifiers only, walking every page (capped so a broad query cannot run away)
 linear search "keyword" --team TEAM_KEY --all --max-items 100 --quiet
 ```
@@ -1041,6 +1081,10 @@ not redirect stderr away.
 | `project view: issues limited to 10; additional issues omitted` | Raise `--issue-limit` |
 | `search: fetched N items across M pages; more available, resume with --cursor XXX` | Not an error — pass `--cursor XXX`, or `--pages N` / `--all` |
 | `search: 0 results (team filter: XXX)` | The team filter excluded everything; retry without `--team` |
+| `search: --fields selects printed columns; 'X' names a search target -- use --search-fields X` | Move that value to `--search-fields`; `--fields` is the column projection |
+| `search: --fields 'X' is not fetched by search` | `search` carries six columns only; get `parent`/`sub_issues`/`project`/`milestone` from `issues list --fields X` |
+| `search: --fields title selects printed columns; pass --search-fields title ...` | Not an error — `title` is valid for both flags, so the CLI says which one it used |
+| `search: invalid --search-fields value 'X'` | Only `title`, `description`, `comments` are searchable (`identifier` is matched from the query text automatically) |
 | `issue view: issue not found` / `<cmd>: issue 'X' not found` | Wrong identifier or no access |
 | `<cmd>: invalid issue identifier; expected TEAM-NUMBER` | Use `ENG-123` form or a UUID |
 | `issue update: state 'X' not found; available states: A, B, C` | Use one of the listed names verbatim |
@@ -1196,8 +1240,10 @@ Commands with `--json` return nested structures. Use these jq paths:
 Every enumeration command (`labels list`, `users list`, `states list`, `milestone list`,
 `issue comment list`) plus `search` reshapes under `--data-only --json` into a flat
 `{"nodes": [...], "pageInfo": {...}, "limit": N}` object — items at `.nodes[]`, keyed by the `--fields`
-names (`search` has no output projection, so its keys are the fixed issue columns plus `url`). That is
-the only JSON form in which `issue comment list` bodies stay verbatim *and* are projected.
+names. On `search` (like `issues list`) the JSON record is the whole row regardless of `--fields`:
+the projection applies to the table and to tab-separated output, not to JSON, so pipe through `jq`
+if you want fewer keys. That is the only JSON form in which `issue comment list` bodies stay
+verbatim *and* are projected.
 
 `.pageInfo` on all of them reflects where the **walk** stopped, not just the last response, so its
 `endCursor` is what to hand back to `--cursor`.

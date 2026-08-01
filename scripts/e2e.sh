@@ -830,8 +830,29 @@ assert "issues list --max-items/--sort/--human-time" 0
 cli search "$RUN_ID" --team "$TEAM" --limit 5
 assert "search (run id, expected to match nothing yet)" 0
 
-cli search "$RUN_ID" --team "$TEAM" --fields title,description,comments --limit 5
-assert "search --fields title,description,comments" 0
+cli search "$RUN_ID" --team "$TEAM" --search-fields title,description,comments --limit 5
+assert "search --search-fields title,description,comments" 0
+
+# The other half of the split: on `search`, `--fields` is a print projection
+# with the same meaning it has on `issues list`.
+if [ "$TABLE_MODE" -eq 1 ]; then
+	cli search "$RUN_ID" --team "$TEAM" --fields identifier,title --limit 5 --data-only
+	assert "search: --fields projection + --data-only" 0
+	if [ "$LAST_RC" -eq 0 ] && [ -s "$LAST_OUT" ]; then
+		# Like issues list, search --data-only appends the url column, so two
+		# requested fields yield at least three tab-separated columns.
+		NARROW="$(awk -F'\t' 'NF < 3 {c++} END {print c+0}' "$LAST_OUT")"
+		check "search: --data-only rows carry fields + url column" "0" "$NARROW"
+	fi
+else
+	skip "search: --fields projection + --data-only" "config.default_output=json"
+fi
+
+# A search-only value in `--fields` is rejected locally, naming the other flag
+# instead of reading like a typo. No request is made.
+cli search "$RUN_ID" --team "$TEAM" --fields comments --limit 5
+assert "search: --fields comments points at --search-fields" 1 \
+	--stdout-empty --err-contains "--search-fields comments"
 
 # Pick a workflow state name for the update-by-name case. Prefer a
 # non-terminal type so the issue stays visible to default-filtered queries.
