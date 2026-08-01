@@ -626,6 +626,15 @@ linear issues list --team TEAM_KEY --created-since 2026-07-01T00:00:00Z \
   --sort created:asc --limit 20 --sub-limit 0 --quiet
 ```
 
+### Sort by something other than a timestamp
+```bash
+# Highest priority first (any IssueSortInput field works, e.g. dueDate, manual, workflowState)
+linear issues list --team TEAM_KEY --sort priority:asc --limit 20 --sub-limit 0
+
+# Soonest due date first; issues with no due date fall wherever Linear puts them
+linear issues list --team TEAM_KEY --sort dueDate:asc --limit 20 --sub-limit 0
+```
+
 ### Create an issue
 ```bash
 linear issue create --team TEAM_KEY --title "Fix bug" --yes --quiet
@@ -919,9 +928,14 @@ Per-command flags worth knowing:
 - `--updated-since TS` / `--created-since TS` — `issues list` only. Both map to a **strictly greater
   than** comparator on `updatedAt`/`createdAt`, so the boundary timestamp itself is excluded. The value
   is forwarded to Linear verbatim; pass an ISO 8601 timestamp
-- `--sort FIELD[:asc|desc]` — `issues list` only. `FIELD` is `created` or `updated` (`createdAt`/`updatedAt`
-  also accepted, case-insensitive); direction defaults to `desc`. Anything else is
-  `issues list: invalid --sort value`
+- `--sort FIELD[:asc|desc]` — `issues list` only. `FIELD` is any field Linear's `IssueSortInput` accepts,
+  matched case-insensitively: `priority`, `estimate`, `title`, `label`, `labelGroup`, `slaStatus`,
+  `createdAt`, `updatedAt`, `completedAt`, `dueDate`, `accumulatedStateUpdatedAt`, `cycle`, `milestone`,
+  `assignee`, `delegate`, `project`, `team`, `manual`, `workflowState`, `customer`, `customerRevenue`,
+  `customerCount`, `customerImportantCount`, `rootIssue`, `linkCount`, `release`. `created` and `updated`
+  remain aliases for `createdAt`/`updatedAt`. Direction defaults to `desc`. Unknown names are rejected
+  locally — no request is sent — with `issues list: invalid --sort value` followed by the list of valid
+  fields; `linear help issues` prints the same list
 - `--yes` — required for every mutation, including a `mutation` document passed to `gql` (alias: `--force`).
   `issue comment update|delete`, `issue start`, `issue pr`, and `milestone create|update|delete` are
   gated the same way
@@ -991,7 +1005,7 @@ not redirect stderr away.
 | `issues list: invalid --fields value` | Field name not in that command's vocabulary (see above) |
 | `issues list: no fields selected` | `--fields` resolved to an empty set |
 | `issues list: invalid --max-items value` | `--max-items 0` is rejected; omit the flag instead |
-| `issues list: invalid --sort value` | `--sort` takes `created\|updated` optionally suffixed `:asc`/`:desc` — nothing else |
+| `issues list: invalid --sort value` | `--sort` takes an `IssueSortInput` field (plus the `created`/`updated` aliases), optionally suffixed `:asc`/`:desc`. The next two stderr lines list every accepted field; `linear help issues` prints the same list |
 | `issue delete: UnknownFlag` on `--reason` | `--reason` was removed — `issueDelete` has no reason parameter, so it never reached Linear. Record it on your side, or leave a comment on the issue before deleting |
 | `issues list: fetched N items across M pages; more available, resume with --cursor XXX` | Not an error — pass `--cursor XXX`, or `--pages N` / `--all` |
 | `issues list: stopped after N items due to --max-items` | Not an error — raise `--max-items` if you need more |

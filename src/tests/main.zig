@@ -13076,3 +13076,257 @@ test "issues list --sort sends sort without orderBy" {
     const order = updated.object.get("order") orelse return error.TestExpectedResult;
     try std.testing.expectEqualStrings("Descending", order.string);
 }
+
+/// One `--sort` value and the `IssueSortInput` entry it must turn into.
+const SortWireCase = struct {
+    input: []const u8,
+    key: []const u8,
+    order: []const u8,
+};
+
+/// Runs `issues list --sort <case.input>` against the mock and asserts the
+/// `sort` variable the command actually put on the wire.
+fn expectIssuesSortVariable(
+    allocator: std.mem.Allocator,
+    server: *mock_graphql.MockServer,
+    cfg: *config.Config,
+    case: SortWireCase,
+) !void {
+    const Runner = struct {
+        allocator: std.mem.Allocator,
+        cfg: *config.Config,
+        sort: []const u8,
+    };
+    const runIssues = struct {
+        pub fn call(r: *const Runner) !u8 {
+            var args = [_][]const u8{ "--limit", "1", "--sort", r.sort };
+            return issues_cmd.run(.{
+                .allocator = r.allocator,
+                .io = test_io,
+                .config = r.cfg,
+                .args = args[0..],
+                .retries = 0,
+                .timeout_ms = 10_000,
+                .json_output = true,
+            });
+        }
+    }.call;
+    const runner = Runner{ .allocator = allocator, .cfg = cfg, .sort = case.input };
+
+    const capture = try captureOutput(allocator, &runner, runIssues);
+    defer capture.deinit(allocator);
+    if (capture.exit_code != 0) {
+        std.debug.print("issues list --sort {s} stderr: {s}\n", .{ case.input, capture.stderr });
+    }
+    try std.testing.expectEqual(@as(u8, 0), capture.exit_code);
+
+    const recorded = server.lastRequest() orelse return error.TestExpectedResult;
+    const vars_json = recorded.variables_json orelse return error.TestExpectedResult;
+    var parsed = try std.json.parseFromSlice(std.json.Value, allocator, vars_json, .{});
+    defer parsed.deinit();
+    const vars_root = parsed.value;
+    if (vars_root != .object) return error.TestExpectedResult;
+
+    // The no-orderBy invariant holds for every field, not just updatedAt.
+    try std.testing.expect(vars_root.object.get("orderBy") == null);
+
+    const sort_value = vars_root.object.get("sort") orelse return error.TestExpectedResult;
+    if (sort_value != .array) return error.TestExpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), sort_value.array.items.len);
+    const entry = sort_value.array.items[0];
+    if (entry != .object) return error.TestExpectedResult;
+    // Exactly one field per entry: a second key would be a different sort.
+    try std.testing.expectEqual(@as(usize, 1), entry.object.count());
+    const detail = entry.object.get(case.key) orelse return error.TestExpectedResult;
+    if (detail != .object) return error.TestExpectedResult;
+    const order = detail.object.get("order") orelse return error.TestExpectedResult;
+    if (order != .string) return error.TestExpectedResult;
+    try std.testing.expectEqualStrings(case.order, order.string);
+}
+
+test "issues list --sort sends the requested IssueSortInput field" {
+    // `--sort` used to accept only created/updated. The schema's IssueSortInput
+    // takes 26 fields, all with the same `{ <field>: { order } }` shape, so the
+    // sample here spans the kinds that exist -- a scalar (priority), the manual
+    // ordering, a nullable date (dueDate), a string (title), a relation
+    // (assignee) -- and pins the alias, case, and direction handling with them.
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    try server.set("Issues", fixtures.issues_response);
+    try server.set("TeamLookup", fixtures.issue_create_team_lookup);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    const cases = [_]SortWireCase{
+        .{ .input = "priority", .key = "priority", .order = "Descending" },
+        .{ .input = "manual", .key = "manual", .order = "Descending" },
+        .{ .input = "dueDate:asc", .key = "dueDate", .order = "Ascending" },
+        .{ .input = "title:asc", .key = "title", .order = "Ascending" },
+        .{ .input = "assignee:desc", .key = "assignee", .order = "Descending" },
+        .{ .input = "workflowState", .key = "workflowState", .order = "Descending" },
+        .{ .input = "customerImportantCount:asc", .key = "customerImportantCount", .order = "Ascending" },
+        // The two originally documented values are aliases, not separate fields.
+        .{ .input = "created", .key = "createdAt", .order = "Descending" },
+        .{ .input = "updated:asc", .key = "updatedAt", .order = "Ascending" },
+        // Field and direction both match case-insensitively.
+        .{ .input = "DUEDATE", .key = "dueDate", .order = "Descending" },
+        .{ .input = "LabelGroup:ASC", .key = "labelGroup", .order = "Ascending" },
+        .{ .input = "CreatedAt:Desc", .key = "createdAt", .order = "Descending" },
+        // No suffix means descending.
+        .{ .input = "estimate", .key = "estimate", .order = "Descending" },
+    };
+    for (cases) |case| try expectIssuesSortVariable(allocator, &server, &cfg, case);
+}
+
+test "issues list --sort accepts every IssueSortInput field" {
+    // The full vocabulary, spelled as the schema spells it, plus the two short
+    // aliases. Parsing is checked directly because sending 26 requests to prove
+    // the same mapping would only re-test `expectIssuesSortVariable`.
+    const Case = struct {
+        input: []const u8,
+        /// `SortField` tag; the two timestamp fields keep their short tags.
+        tag: []const u8,
+    };
+    const cases = [_]Case{
+        .{ .input = "priority", .tag = "priority" },
+        .{ .input = "estimate", .tag = "estimate" },
+        .{ .input = "title", .tag = "title" },
+        .{ .input = "label", .tag = "label" },
+        .{ .input = "labelGroup", .tag = "labelGroup" },
+        .{ .input = "slaStatus", .tag = "slaStatus" },
+        .{ .input = "createdAt", .tag = "created" },
+        .{ .input = "updatedAt", .tag = "updated" },
+        .{ .input = "completedAt", .tag = "completedAt" },
+        .{ .input = "dueDate", .tag = "dueDate" },
+        .{ .input = "accumulatedStateUpdatedAt", .tag = "accumulatedStateUpdatedAt" },
+        .{ .input = "cycle", .tag = "cycle" },
+        .{ .input = "milestone", .tag = "milestone" },
+        .{ .input = "assignee", .tag = "assignee" },
+        .{ .input = "delegate", .tag = "delegate" },
+        .{ .input = "project", .tag = "project" },
+        .{ .input = "team", .tag = "team" },
+        .{ .input = "manual", .tag = "manual" },
+        .{ .input = "workflowState", .tag = "workflowState" },
+        .{ .input = "customer", .tag = "customer" },
+        .{ .input = "customerRevenue", .tag = "customerRevenue" },
+        .{ .input = "customerCount", .tag = "customerCount" },
+        .{ .input = "customerImportantCount", .tag = "customerImportantCount" },
+        .{ .input = "rootIssue", .tag = "rootIssue" },
+        .{ .input = "linkCount", .tag = "linkCount" },
+        .{ .input = "release", .tag = "release" },
+        // Aliases for the values the flag shipped with.
+        .{ .input = "created", .tag = "created" },
+        .{ .input = "updated", .tag = "updated" },
+    };
+
+    for (cases) |case| {
+        const args = [_][]const u8{ "--sort", case.input };
+        const opts = try issues_cmd.parseOptions(args[0..]);
+        try std.testing.expect(opts.sort != null);
+        try std.testing.expectEqualStrings(case.tag, @tagName(opts.sort.?.field));
+        // Direction is optional and defaults to descending.
+        try std.testing.expectEqualStrings("desc", @tagName(opts.sort.?.direction));
+
+        // ...and every one of them matches case-insensitively.
+        var upper_buf: [64]u8 = undefined;
+        const upper = std.ascii.upperString(upper_buf[0..case.input.len], case.input);
+        const upper_args = [_][]const u8{ "--sort", upper };
+        const upper_opts = try issues_cmd.parseOptions(upper_args[0..]);
+        try std.testing.expect(upper_opts.sort != null);
+        try std.testing.expectEqualStrings(case.tag, @tagName(upper_opts.sort.?.field));
+    }
+
+    // Both directions parse, on a field that is not one of the aliases.
+    const asc_args = [_][]const u8{ "--sort", "priority:asc" };
+    const asc_opts = try issues_cmd.parseOptions(asc_args[0..]);
+    try std.testing.expectEqualStrings("asc", @tagName(asc_opts.sort.?.direction));
+    const desc_args = [_][]const u8{"--sort=priority:desc"};
+    const desc_opts = try issues_cmd.parseOptions(desc_args[0..]);
+    try std.testing.expectEqualStrings("desc", @tagName(desc_opts.sort.?.direction));
+}
+
+test "issues list --sort rejects an unknown field before any request" {
+    // Validation is local: an unsortable field name must fail here, with the
+    // vocabulary printed, rather than travelling to Linear to be rejected.
+    const allocator = std.testing.allocator;
+
+    var server = mock_graphql.MockServer.init(allocator);
+    defer server.deinit();
+    var scope = mock_graphql.useServer(&server);
+    defer scope.restore();
+    // Available on purpose -- the point is that it goes unused.
+    try server.set("Issues", fixtures.issues_response);
+    try server.set("TeamLookup", fixtures.issue_create_team_lookup);
+
+    var cfg = try makeTestConfig(allocator);
+    defer cfg.deinit();
+
+    const Runner = struct {
+        allocator: std.mem.Allocator,
+        cfg: *config.Config,
+    };
+    const runIssues = struct {
+        pub fn call(r: *const Runner) !u8 {
+            // A real Issue field, but not one IssueSortInput accepts.
+            var args = [_][]const u8{ "--limit", "1", "--sort", "priorityLabel" };
+            return issues_cmd.run(.{
+                .allocator = r.allocator,
+                .io = test_io,
+                .config = r.cfg,
+                .args = args[0..],
+                .retries = 0,
+                .timeout_ms = 10_000,
+                .json_output = true,
+            });
+        }
+    }.call;
+    const runner = Runner{ .allocator = allocator, .cfg = &cfg };
+
+    const capture = try captureOutput(allocator, &runner, runIssues);
+    defer capture.deinit(allocator);
+
+    try std.testing.expectEqual(@as(u8, 1), capture.exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, capture.stderr, "issues list: invalid --sort value\n"));
+    // The diagnostic has to name the alternatives now that there are 26.
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "valid --sort fields: priority, estimate, title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "accumulatedStateUpdatedAt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "release") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capture.stderr, "created -> createdAt, updated -> updatedAt") != null);
+    // Nothing was sent: the typo cost no request.
+    try std.testing.expectEqual(@as(usize, 0), server.request_count);
+
+    // The same verdict at the parser, for the shapes that can go wrong.
+    const unknown = [_][]const u8{ "--sort", "priorityLabel" };
+    try std.testing.expectError(error.InvalidSort, issues_cmd.parseOptions(unknown[0..]));
+    const near_miss = [_][]const u8{ "--sort", "state" };
+    try std.testing.expectError(error.InvalidSort, issues_cmd.parseOptions(near_miss[0..]));
+    const empty_field = [_][]const u8{ "--sort", ":asc" };
+    try std.testing.expectError(error.InvalidSort, issues_cmd.parseOptions(empty_field[0..]));
+    const bad_direction = [_][]const u8{ "--sort", "priority:sideways" };
+    try std.testing.expectError(error.InvalidSort, issues_cmd.parseOptions(bad_direction[0..]));
+    const extra_suffix = [_][]const u8{ "--sort", "priority:asc:desc" };
+    try std.testing.expectError(error.InvalidSort, issues_cmd.parseOptions(extra_suffix[0..]));
+}
+
+test "issues list usage lists the sortable fields" {
+    const allocator = std.testing.allocator;
+
+    var buffer: std.Io.Writer.Allocating = .init(allocator);
+    defer buffer.deinit();
+    try issues_cmd.usage(&buffer.writer);
+
+    const text = buffer.written();
+    // The help is where `--sort` sends people, so it carries the whole set...
+    try std.testing.expect(std.mem.indexOf(u8, text, "priority, estimate, title") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "accumulatedStateUpdatedAt") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "linkCount, release") != null);
+    try std.testing.expect(std.mem.indexOf(u8, text, "Aliases: created -> createdAt, updated -> updatedAt") != null);
+    // ...but not in the signature line, which stays one readable line.
+    const first_line_end = std.mem.indexOfScalar(u8, text, '\n') orelse text.len;
+    try std.testing.expect(std.mem.indexOf(u8, text[0..first_line_end], "accumulatedStateUpdatedAt") == null);
+}

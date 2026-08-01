@@ -17,9 +17,90 @@ pub const Context = struct {
     endpoint: ?[]const u8 = null,
 };
 
+/// Every field `IssueSortInput` accepts, in schema declaration order. Each one
+/// takes its own input type (`PrioritySort`, `ManualSort`, ...), but all of them
+/// carry the same `order: PaginationSortOrder`, so one `{ <field>: { order } }`
+/// shape covers the whole set.
+///
+/// Tag names are the schema spellings, which makes `graphqlName` a plain
+/// `@tagName` for everything but the two timestamp fields: those keep the short
+/// tags the flag shipped with (`--sort created|updated`), and map back to
+/// `createdAt`/`updatedAt` on the wire.
 const SortField = enum {
+    priority,
+    estimate,
+    title,
+    label,
+    labelGroup,
+    slaStatus,
     created,
     updated,
+    completedAt,
+    dueDate,
+    accumulatedStateUpdatedAt,
+    cycle,
+    milestone,
+    assignee,
+    delegate,
+    project,
+    team,
+    manual,
+    workflowState,
+    customer,
+    customerRevenue,
+    customerCount,
+    customerImportantCount,
+    rootIssue,
+    linkCount,
+    release,
+
+    /// The `IssueSortInput` key this field is sent as, and the canonical value
+    /// `--sort` accepts for it.
+    fn graphqlName(self: SortField) []const u8 {
+        return switch (self) {
+            .created => "createdAt",
+            .updated => "updatedAt",
+            else => @tagName(self),
+        };
+    }
+};
+
+/// Canonical `--sort` field names, comma-joined for the invalid-value
+/// diagnostic. Derived from `SortField`, so a new field cannot drift out of the
+/// message that lists them.
+const sort_field_list: []const u8 = blk: {
+    var out: []const u8 = "";
+    for (std.enums.values(SortField), 0..) |field, idx| {
+        const name: []const u8 = field.graphqlName();
+        out = if (idx == 0) name else out ++ ", " ++ name;
+    }
+    break :blk out;
+};
+
+/// Column the help text's wrapped field list continues at (the description
+/// column, past the `Fields: ` label).
+const sort_help_indent = " " ** 32;
+/// Width the wrapped field list is allowed to occupy after `sort_help_indent`.
+const sort_help_width = 62;
+
+/// The same list, wrapped into the help text's description column.
+const sort_field_help: []const u8 = blk: {
+    var out: []const u8 = "";
+    var line_len: usize = 0;
+    for (std.enums.values(SortField), 0..) |field, idx| {
+        const name: []const u8 = field.graphqlName();
+        if (idx == 0) {
+            out = name;
+            line_len = name.len;
+        } else if (line_len + 2 + name.len > sort_help_width) {
+            out = out ++ ",\n" ++ sort_help_indent ++ name;
+            line_len = name.len;
+        } else {
+            out = out ++ ", " ++ name;
+            line_len += 2 + name.len;
+        }
+    }
+    break :blk out;
 };
 
 const SortDirection = enum {
@@ -88,6 +169,10 @@ pub fn run(ctx: Context) !u8 {
             else => @errorName(err),
         };
         try stderr.print("issues list: {s}\n", .{message});
+        // "invalid --sort value" alone was actionable when there were two
+        // fields; with the whole `IssueSortInput` vocabulary it is not, so the
+        // diagnostic spells the accepted values out.
+        if (err == error.InvalidSort) try printSortVocabulary(stderr);
         try usage(stderr);
         return 1;
     };
@@ -544,10 +629,7 @@ pub fn run(ctx: Context) !u8 {
             }
             if (opts.sort) |sort_value| {
                 var sort_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
-                const sort_field = switch (sort_value.field) {
-                    .created => "createdAt",
-                    .updated => "updatedAt",
-                };
+                const sort_field = sort_value.field.graphqlName();
                 const sort_dir = switch (sort_value.direction) {
                     .asc => "asc",
                     .desc => "desc",
@@ -606,10 +688,7 @@ pub fn run(ctx: Context) !u8 {
         }
         if (opts.sort) |sort_value| {
             var sort_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
-            const sort_field = switch (sort_value.field) {
-                .created => "createdAt",
-                .updated => "updatedAt",
-            };
+            const sort_field = sort_value.field.graphqlName();
             const sort_dir = switch (sort_value.direction) {
                 .asc => "asc",
                 .desc => "desc",
@@ -843,10 +922,7 @@ fn buildVariables(
     try vars.object.put(allocator, "filter", filter);
     if (cursor) |cursor_value| try vars.object.put(allocator, "after", .{ .string = cursor_value });
     if (opts.sort) |sort| {
-        const field_name = switch (sort.field) {
-            .created => "createdAt",
-            .updated => "updatedAt",
-        };
+        const field_name = sort.field.graphqlName();
         const order_value = switch (sort.direction) {
             .asc => "Ascending",
             .desc => "Descending",
@@ -1166,6 +1242,14 @@ pub fn parseOptions(args: []const []const u8) !Options {
     return opts;
 }
 
+fn printSortVocabulary(writer: anytype) !void {
+    try writer.print("issues list: valid --sort fields: {s}\n", .{sort_field_list});
+    try writer.print(
+        "issues list: aliases created -> createdAt, updated -> updatedAt; optional :asc|:desc suffix (default: desc)\n",
+        .{},
+    );
+}
+
 pub fn usage(writer: anytype) !void {
     try writer.print(
         \\Usage: linear issues list [--team ID|KEY] [--state-type TYPES] [--state-id IDS] [--assignee USER_ID] [--label IDS] [--project ID] [--milestone ID] [--updated-since TS] [--created-since TS] [--sort FIELD[:asc|desc]] [--limit N] [--max-items N] [--sub-limit N] [--cursor CURSOR] [--pages N|--all] [--fields LIST] [--include-projects] [--plain] [--no-truncate] [--human-time] [--quiet] [--data-only] [--help]
@@ -1181,7 +1265,9 @@ pub fn usage(writer: anytype) !void {
         \\  --milestone ID        Filter by milestone id
         \\  --updated-since TS    Only include issues updated after the timestamp
         \\  --created-since TS    Only include issues created after the timestamp
-        \\  --sort FIELD[:DIR]    Sort by created|updated (dir asc|desc, default: desc)
+        \\  --sort FIELD[:DIR]    Sort by an IssueSortInput field (dir asc|desc, default: desc)
+        \\                        Fields: {s}
+        \\                        Aliases: created -> createdAt, updated -> updatedAt
         \\  --limit N             Page size per request (default: 25)
         \\  --max-items N         Stop after emitting N issues (may truncate within a page)
         \\  --sub-limit N         Sub-issues to fetch per parent; also opts into fetching them
@@ -1199,9 +1285,10 @@ pub fn usage(writer: anytype) !void {
         \\  --help                Show this help message
         \\Examples:
         \\  linear issues list --team ENG --pages 2 --limit 50 --sort updated:desc
+        \\  linear issues list --team ENG --sort priority:asc --state-type started
         \\  linear issues list --state-type todo,in_progress --label lbl-1,lbl-2 --assignee user-123
         \\
-    , .{});
+    , .{sort_field_help});
 }
 
 fn parseSort(raw: []const u8) !Sort {
@@ -1210,12 +1297,7 @@ fn parseSort(raw: []const u8) !Sort {
     const field_name = std.mem.trim(u8, field_raw, " \t");
     if (field_name.len == 0) return error.InvalidSort;
 
-    const field = if (std.ascii.eqlIgnoreCase(field_name, "created") or std.ascii.eqlIgnoreCase(field_name, "createdAt"))
-        SortField.created
-    else if (std.ascii.eqlIgnoreCase(field_name, "updated") or std.ascii.eqlIgnoreCase(field_name, "updatedAt"))
-        SortField.updated
-    else
-        return error.InvalidSort;
+    const field = parseSortField(field_name) orelse return error.InvalidSort;
 
     var direction: SortDirection = .desc;
     if (parts.next()) |dir_raw| {
@@ -1235,6 +1317,19 @@ fn parseSort(raw: []const u8) !Sort {
         .field = field,
         .direction = direction,
     };
+}
+
+/// Resolves a user-supplied `--sort` field name. The vocabulary is the schema's
+/// own, matched case-insensitively, plus the two short aliases the flag was
+/// first documented with. Unknown names are rejected here rather than by the
+/// API, so a typo costs no request.
+fn parseSortField(name: []const u8) ?SortField {
+    for (std.enums.values(SortField)) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate.graphqlName())) return candidate;
+    }
+    if (std.ascii.eqlIgnoreCase(name, "created")) return .created;
+    if (std.ascii.eqlIgnoreCase(name, "updated")) return .updated;
+    return null;
 }
 
 fn parseIssueFields(raw: ?[]const u8, buffer: *std.ArrayListUnmanaged(printer.IssueField), allocator: Allocator) ![]const printer.IssueField {
