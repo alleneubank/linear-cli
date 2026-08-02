@@ -8,8 +8,14 @@ pub const upload_prefix = "https://uploads.linear.app/";
 const stdout_marker = "-";
 const transfer_buffer_len: usize = 16 * 1024;
 
+/// Downloaded attachments may carry private issue content, so they are created
+/// owner-only rather than at the process umask default. Matches the mode
+/// `issue view --attachment-dir` uses for the same bytes.
+pub const download_file_mode = 0o600;
+
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
@@ -39,7 +45,7 @@ pub const DownloadError = error{
     UnsupportedCompressionMethod,
     RedirectMissingLocation,
     TooManyRedirects,
-} || std.mem.Allocator.Error || std.http.Client.RequestError || std.http.Client.Request.ReceiveHeadError || std.http.Reader.BodyError || std.io.Writer.Error;
+} || std.mem.Allocator.Error || std.http.Client.RequestError || std.http.Client.Request.ReceiveHeadError || std.http.Reader.BodyError || std.Io.Writer.Error;
 
 pub fn run(ctx: Context) !u8 {
     _ = ctx.json_output;
@@ -47,7 +53,7 @@ pub fn run(ctx: Context) !u8 {
     _ = ctx.endpoint;
 
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseOptions(ctx.args) catch |err| {
         try stderr.print("download: {s}\n", .{@errorName(err)});
@@ -57,7 +63,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try usage(&out_writer.interface);
         return 0;
     }
@@ -87,34 +93,43 @@ pub fn run(ctx: Context) !u8 {
     switch (output_target) {
         .stdout => {
             var stdout_buf: [0]u8 = undefined;
-            var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
-            downloadOnce(ctx.allocator, api_key, url, &stdout_writer.interface, ctx.timeout_ms, &status_code) catch |err| {
+            var stdout_writer = std.Io.File.stdout().writer(ctx.io, &stdout_buf);
+            downloadOnce(ctx.allocator, ctx.io, api_key, url, &stdout_writer.interface, ctx.timeout_ms, &status_code) catch |err| {
                 try reportDownloadError(stderr, api_key, url, err, status_code, ctx.timeout_ms);
                 return 1;
             };
         },
         .path => |path| {
-            var file = std.fs.cwd().createFile(path, .{ .truncate = true }) catch |err| {
+            const file = createOutputFile(ctx.io, path) catch |err| {
                 try stderr.print("download: failed to create {s}: {s}\n", .{ path, @errorName(err) });
                 return 1;
             };
-            defer file.close();
+            defer file.close(ctx.io);
 
             var file_buf: [0]u8 = undefined;
-            var file_writer = file.writer(&file_buf);
-            downloadOnce(ctx.allocator, api_key, url, &file_writer.interface, ctx.timeout_ms, &status_code) catch |err| {
+            var file_writer = file.writer(ctx.io, &file_buf);
+            downloadOnce(ctx.allocator, ctx.io, api_key, url, &file_writer.interface, ctx.timeout_ms, &status_code) catch |err| {
                 try reportDownloadError(stderr, api_key, url, err, status_code, ctx.timeout_ms);
                 return 1;
             };
 
             var stdout_buf: [0]u8 = undefined;
-            var stdout_writer = std.fs.File.stdout().writer(&stdout_buf);
+            var stdout_writer = std.Io.File.stdout().writer(ctx.io, &stdout_buf);
             try stdout_writer.interface.writeAll(path);
             try stdout_writer.interface.writeByte('\n');
         },
     }
 
     return 0;
+}
+
+/// Creates the download target owner-only so the attachment is never readable
+/// by other local users, not even between creation and the first write.
+pub fn createOutputFile(io: std.Io, path: []const u8) !std.Io.File {
+    return std.Io.Dir.cwd().createFile(io, path, .{
+        .truncate = true,
+        .permissions = .fromMode(download_file_mode),
+    });
 }
 
 pub fn isUploadUrl(url: []const u8) bool {
@@ -136,13 +151,13 @@ pub fn downloadWithClient(
     client: *std.http.Client,
     api_key: []const u8,
     url: []const u8,
-    writer: *std.io.Writer,
+    writer: *std.Io.Writer,
     timeout_ms: u32,
     status_out: *u16,
 ) DownloadError!void {
     if (!isUploadUrl(url)) return error.InvalidUrl;
 
-    const start_ms: i64 = std.time.milliTimestamp();
+    const start_ms: i64 = std.Io.Clock.real.now(client.io).toMilliseconds();
     const deadline_ms = start_ms + @as(i64, @intCast(timeout_ms));
 
     // First request to Linear with auth - may redirect to CDN
@@ -151,7 +166,7 @@ pub fn downloadWithClient(
     var include_auth = true;
 
     while (true) {
-        if (std.time.milliTimestamp() >= deadline_ms) return error.RequestTimedOut;
+        if (std.Io.Clock.real.now(client.io).toMilliseconds() >= deadline_ms) return error.RequestTimedOut;
 
         var req = try client.request(.GET, current_uri, .{
             .redirect_behavior = .unhandled,
@@ -162,12 +177,12 @@ pub fn downloadWithClient(
         defer req.deinit();
 
         try req.sendBodiless();
-        if (std.time.milliTimestamp() >= deadline_ms) return error.RequestTimedOut;
+        if (std.Io.Clock.real.now(client.io).toMilliseconds() >= deadline_ms) return error.RequestTimedOut;
 
         var response = try req.receiveHead(&.{});
         status_out.* = @intFromEnum(response.head.status);
 
-        if (std.time.milliTimestamp() >= deadline_ms) return error.RequestTimedOut;
+        if (std.Io.Clock.real.now(client.io).toMilliseconds() >= deadline_ms) return error.RequestTimedOut;
 
         // Handle redirects (301, 302, 303, 307, 308)
         if (response.head.status.class() == .redirect) {
@@ -200,10 +215,9 @@ pub fn downloadWithClient(
         const reader = response.readerDecompressing(&transfer_buffer, &decompress, decompress_buffer);
 
         while (true) {
-            if (std.time.milliTimestamp() >= deadline_ms) return error.RequestTimedOut;
+            if (std.Io.Clock.real.now(client.io).toMilliseconds() >= deadline_ms) return error.RequestTimedOut;
             const amount = reader.readSliceShort(&output_buffer) catch |err| switch (err) {
                 error.ReadFailed => return response.bodyErr() orelse error.ResponseReadFailed,
-                else => return err,
             };
             if (amount == 0) break;
             try writer.writeAll(output_buffer[0..amount]);
@@ -214,13 +228,14 @@ pub fn downloadWithClient(
 
 fn downloadOnce(
     allocator: Allocator,
+    io: std.Io,
     api_key: []const u8,
     url: []const u8,
-    writer: *std.io.Writer,
+    writer: *std.Io.Writer,
     timeout_ms: u32,
     status_out: *u16,
 ) DownloadError!void {
-    var client = std.http.Client{ .allocator = allocator };
+    var client = std.http.Client{ .allocator = allocator, .io = io };
     defer client.deinit();
     try downloadWithClient(allocator, &client, api_key, url, writer, timeout_ms, status_out);
 }
@@ -280,7 +295,7 @@ fn trimUrl(url: []const u8) []const u8 {
 }
 
 fn reportDownloadError(
-    stderr: *std.io.Writer,
+    stderr: *std.Io.Writer,
     api_key: []const u8,
     url: []const u8,
     err: DownloadError,

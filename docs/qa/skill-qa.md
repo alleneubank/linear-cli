@@ -7,7 +7,7 @@ Prompt for Claude Code to verify skill documentation accuracy.
 From the repo root, start a Claude Code session with the QA prompt pre-filled:
 
 ```bash
-claude "$(cat skills/linear/QA.md | sed -n '/^~~~$/,/^~~~$/p' | sed '1d;$d')"
+claude "$(cat docs/qa/skill-qa.md | sed -n '/^~~~$/,/^~~~$/p' | sed '1d;$d')"
 ```
 
 Or manually: start a new session and paste the prompt below.

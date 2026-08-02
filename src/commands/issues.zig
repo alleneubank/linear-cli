@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
@@ -16,9 +17,90 @@ pub const Context = struct {
     endpoint: ?[]const u8 = null,
 };
 
+/// Every field `IssueSortInput` accepts, in schema declaration order. Each one
+/// takes its own input type (`PrioritySort`, `ManualSort`, ...), but all of them
+/// carry the same `order: PaginationSortOrder`, so one `{ <field>: { order } }`
+/// shape covers the whole set.
+///
+/// Tag names are the schema spellings, which makes `graphqlName` a plain
+/// `@tagName` for everything but the two timestamp fields: those keep the short
+/// tags the flag shipped with (`--sort created|updated`), and map back to
+/// `createdAt`/`updatedAt` on the wire.
 const SortField = enum {
+    priority,
+    estimate,
+    title,
+    label,
+    labelGroup,
+    slaStatus,
     created,
     updated,
+    completedAt,
+    dueDate,
+    accumulatedStateUpdatedAt,
+    cycle,
+    milestone,
+    assignee,
+    delegate,
+    project,
+    team,
+    manual,
+    workflowState,
+    customer,
+    customerRevenue,
+    customerCount,
+    customerImportantCount,
+    rootIssue,
+    linkCount,
+    release,
+
+    /// The `IssueSortInput` key this field is sent as, and the canonical value
+    /// `--sort` accepts for it.
+    fn graphqlName(self: SortField) []const u8 {
+        return switch (self) {
+            .created => "createdAt",
+            .updated => "updatedAt",
+            else => @tagName(self),
+        };
+    }
+};
+
+/// Canonical `--sort` field names, comma-joined for the invalid-value
+/// diagnostic. Derived from `SortField`, so a new field cannot drift out of the
+/// message that lists them.
+const sort_field_list: []const u8 = blk: {
+    var out: []const u8 = "";
+    for (std.enums.values(SortField), 0..) |field, idx| {
+        const name: []const u8 = field.graphqlName();
+        out = if (idx == 0) name else out ++ ", " ++ name;
+    }
+    break :blk out;
+};
+
+/// Column the help text's wrapped field list continues at (the description
+/// column, past the `Fields: ` label).
+const sort_help_indent = " " ** 32;
+/// Width the wrapped field list is allowed to occupy after `sort_help_indent`.
+const sort_help_width = 62;
+
+/// The same list, wrapped into the help text's description column.
+const sort_field_help: []const u8 = blk: {
+    var out: []const u8 = "";
+    var line_len: usize = 0;
+    for (std.enums.values(SortField), 0..) |field, idx| {
+        const name: []const u8 = field.graphqlName();
+        if (idx == 0) {
+            out = name;
+            line_len = name.len;
+        } else if (line_len + 2 + name.len > sort_help_width) {
+            out = out ++ ",\n" ++ sort_help_indent ++ name;
+            line_len = name.len;
+        } else {
+            out = out ++ ", " ++ name;
+            line_len += 2 + name.len;
+        }
+    }
+    break :blk out;
 };
 
 const SortDirection = enum {
@@ -31,6 +113,49 @@ const Sort = struct {
     direction: SortDirection,
 };
 
+/// `PaginationNulls`, the second key every `*Sort` input carries beside `order`.
+/// It decides where rows whose sort key is null land, which matters because so
+/// many sortable fields are routinely null (`dueDate`, `completedAt`, `cycle`,
+/// `milestone`, `slaStatus`, `delegate`, `release`, and every `customer*` field
+/// on a non-customer issue): `--sort dueDate:asc --limit 20` can otherwise spend
+/// the whole page on issues with no due date at all.
+const SortNulls = enum {
+    first,
+    last,
+
+    /// The `PaginationNulls` value this is sent as. Lowercase, unlike
+    /// `PaginationSortOrder` (`Ascending`/`Descending`) in the same object --
+    /// Linear rejects `First`. The tags are already the wire spelling, so this
+    /// is a plain `@tagName`; it exists to keep that casing contract named in
+    /// one place instead of inline at the emit site.
+    fn wireName(self: SortNulls) []const u8 {
+        return @tagName(self);
+    }
+};
+
+/// Accepted `--sort-nulls` values, comma-joined for the invalid-value
+/// diagnostic and the help text. Derived from `SortNulls` for the same reason
+/// `sort_field_list` is derived from `SortField`: the message cannot drift from
+/// what the parser accepts.
+const sort_nulls_list: []const u8 = blk: {
+    var out: []const u8 = "";
+    for (std.enums.values(SortNulls), 0..) |value, idx| {
+        const name: []const u8 = value.wireName();
+        out = if (idx == 0) name else out ++ ", " ++ name;
+    }
+    break :blk out;
+};
+
+/// The same list as a `first|last` alternation, for the usage signature.
+const sort_nulls_choices: []const u8 = blk: {
+    var out: []const u8 = "";
+    for (std.enums.values(SortNulls), 0..) |value, idx| {
+        const name: []const u8 = value.wireName();
+        out = if (idx == 0) name else out ++ "|" ++ name;
+    }
+    break :blk out;
+};
+
 const Options = struct {
     team: ?[]const u8 = null,
     state_type: ?[]const u8 = null,
@@ -40,9 +165,16 @@ const Options = struct {
     updated_since: ?[]const u8 = null,
     created_since: ?[]const u8 = null,
     sort: ?Sort = null,
+    /// Null placement for `sort`. Lives beside `sort` rather than inside it
+    /// because it arrives on its own flag: `--sort-nulls last --sort dueDate`
+    /// and `--sort dueDate --sort-nulls last` have to mean the same thing, and
+    /// a field inside `Sort` would be clobbered whenever `--sort` was parsed
+    /// second. `null` means the flag was absent, and nothing is sent.
+    sort_nulls: ?SortNulls = null,
     limit: usize = 25,
     max_items: ?usize = null,
     sub_limit: usize = 10,
+    sub_limit_explicit: bool = false,
     cursor: ?[]const u8 = null,
     pages: ?usize = null,
     all: bool = false,
@@ -76,23 +208,30 @@ const DataRow = struct {
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     var opts = parseOptions(ctx.args) catch |err| {
         const message = switch (err) {
             error.InvalidPageCount => "invalid --pages value",
             error.InvalidLimit => "invalid --limit value",
             error.InvalidSort => "invalid --sort value",
+            error.InvalidSortNulls => "invalid --sort-nulls value",
+            error.SortNullsRequiresSort => "--sort-nulls requires --sort",
             else => @errorName(err),
         };
         try stderr.print("issues list: {s}\n", .{message});
+        // "invalid --sort value" alone was actionable when there were two
+        // fields; with the whole `IssueSortInput` vocabulary it is not, so the
+        // diagnostic spells the accepted values out.
+        if (err == error.InvalidSort) try printSortVocabulary(stderr);
+        if (err == error.InvalidSortNulls) try printSortNullsVocabulary(stderr);
         try usage(stderr);
         return 1;
     };
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try usage(&out_writer.interface);
         return 0;
     }
@@ -101,7 +240,7 @@ pub fn run(ctx: Context) !u8 {
         return 1;
     };
 
-    var field_buf = std.ArrayListUnmanaged(printer.IssueField){};
+    var field_buf = std.ArrayListUnmanaged(printer.IssueField).empty;
     defer field_buf.deinit(ctx.allocator);
     var selected_fields = parseIssueFields(opts.fields, &field_buf, ctx.allocator) catch |err| {
         const message = switch (err) {
@@ -116,7 +255,13 @@ pub fn run(ctx: Context) !u8 {
         if (!containsIssueField(selected_fields, .milestone)) try field_buf.append(ctx.allocator, .milestone);
         selected_fields = field_buf.items;
     }
-    const sub_enabled = opts.sub_limit > 0;
+    // `children(first:)` is a per-issue sub-query, so it is only worth paying for
+    // when the caller actually wants sub-issues: either the `sub_issues` column is
+    // selected, or `--sub-limit` was passed explicitly. Without this gate the
+    // default field set (which excludes sub-issues) still fetched and discarded
+    // them. `--sub-limit 0` remains the explicit opt-out.
+    const sub_requested = containsIssueField(selected_fields, .sub_issues) or opts.sub_limit_explicit;
+    const sub_enabled = sub_requested and opts.sub_limit > 0;
     if (!sub_enabled) {
         var write: usize = 0;
         for (selected_fields) |field| {
@@ -159,7 +304,7 @@ pub fn run(ctx: Context) !u8 {
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var query_builder = std.ArrayListUnmanaged(u8){};
+    var query_builder = std.ArrayListUnmanaged(u8).empty;
     defer query_builder.deinit(ctx.allocator);
     try query_builder.appendSlice(
         ctx.allocator,
@@ -180,7 +325,7 @@ pub fn run(ctx: Context) !u8 {
     );
     const query = query_builder.items;
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -213,25 +358,25 @@ pub fn run(ctx: Context) !u8 {
         }
     }
 
-    var responses = std.ArrayListUnmanaged(graphql.GraphqlClient.Response){};
+    var responses = std.ArrayListUnmanaged(graphql.GraphqlClient.Response).empty;
     defer {
         for (responses.items) |*resp| resp.deinit();
         responses.deinit(ctx.allocator);
     }
 
-    var rows = std.ArrayListUnmanaged(printer.IssueRow){};
+    var rows = std.ArrayListUnmanaged(printer.IssueRow).empty;
     defer rows.deinit(ctx.allocator);
 
-    var owned_times = std.ArrayListUnmanaged([]u8){};
+    var owned_times = std.ArrayListUnmanaged([]u8).empty;
     defer {
         for (owned_times.items) |value| ctx.allocator.free(value);
         owned_times.deinit(ctx.allocator);
     }
 
-    var data_rows = std.ArrayListUnmanaged(DataRow){};
+    var data_rows = std.ArrayListUnmanaged(DataRow).empty;
     defer data_rows.deinit(ctx.allocator);
 
-    var nodes_accumulator = std.ArrayListUnmanaged(std.json.Value){};
+    var nodes_accumulator = std.ArrayListUnmanaged(std.json.Value).empty;
     defer nodes_accumulator.deinit(ctx.allocator);
 
     var total_fetched: usize = 0;
@@ -275,7 +420,11 @@ pub fn run(ctx: Context) !u8 {
         var response_owned = true;
         errdefer if (response_owned) response.deinit();
 
-        common.checkResponse("issues", &response, stderr, api_key) catch {
+        // `errdefer` does not fire on `return 1` — that is a successful return of
+        // an exit code — so a rejected page has to be freed by hand before the
+        // ownership transfer below takes over.
+        common.checkResponse(ctx.io, "issues", &response, stderr, api_key) catch {
+            if (response_owned) response.deinit();
             return 1;
         };
 
@@ -324,7 +473,7 @@ pub fn run(ctx: Context) !u8 {
                     continue;
                 }
 
-                var cleaned = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+                var cleaned = std.json.Value{ .object = std.json.ObjectMap.empty };
                 var iter = node.object.iterator();
                 while (iter.next()) |entry| {
                     const key = entry.key_ptr.*;
@@ -335,7 +484,7 @@ pub fn run(ctx: Context) !u8 {
                         (!project_enabled and std.mem.eql(u8, key, "project")) or
                         (!milestone_enabled and is_milestone_key);
                     if (skip) continue;
-                    try cleaned.object.put(key, entry.value_ptr.*);
+                    try cleaned.object.put(var_alloc, key, entry.value_ptr.*);
                 }
                 try nodes_accumulator.append(ctx.allocator, cleaned);
             }
@@ -367,7 +516,7 @@ pub fn run(ctx: Context) !u8 {
                     const subs_obj = common.getObjectField(node, "children") orelse common.getObjectField(node, "subIssues");
                     if (subs_obj) |subs| {
                         if (common.getArrayField(subs, "nodes")) |sub_nodes| {
-                            var joined = std.ArrayListUnmanaged(u8){};
+                            var joined = std.ArrayListUnmanaged(u8).empty;
                             defer joined.deinit(ctx.allocator);
                             for (sub_nodes.items, 0..) |sub, idx| {
                                 if (sub != .object) continue;
@@ -399,7 +548,7 @@ pub fn run(ctx: Context) !u8 {
 
                 var updated_display = updated_raw;
                 if (opts.human_time and want_table) {
-                    const formatted = printer.humanTime(ctx.allocator, updated_raw, null) catch null;
+                    const formatted = printer.humanTime(ctx.allocator, ctx.io, updated_raw, null) catch null;
                     if (formatted) |value| {
                         try owned_times.append(ctx.allocator, value);
                         updated_display = value;
@@ -478,25 +627,25 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.quiet) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         for (data_rows.items) |row| {
             try out_writer.interface.writeAll(row.identifier);
             try out_writer.interface.writeByte('\n');
         }
     } else if (opts.data_only) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         if (ctx.json_output) {
             var out_array = std.json.Array.init(var_alloc);
             for (data_rows.items) |row| {
-                var obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-                try obj.object.put("identifier", .{ .string = row.identifier });
-                try obj.object.put("title", .{ .string = row.title });
-                try obj.object.put("state", .{ .string = row.state });
-                try obj.object.put("assignee", .{ .string = row.assignee });
-                try obj.object.put("priority", .{ .string = row.priority });
-                if (row.parent_identifier.len > 0) try obj.object.put("parent_identifier", .{ .string = row.parent_identifier });
-                if (row.parent_url.len > 0) try obj.object.put("parent_url", .{ .string = row.parent_url });
+                var obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+                try obj.object.put(var_alloc, "identifier", .{ .string = row.identifier });
+                try obj.object.put(var_alloc, "title", .{ .string = row.title });
+                try obj.object.put(var_alloc, "state", .{ .string = row.state });
+                try obj.object.put(var_alloc, "assignee", .{ .string = row.assignee });
+                try obj.object.put(var_alloc, "priority", .{ .string = row.priority });
+                if (row.parent_identifier.len > 0) try obj.object.put(var_alloc, "parent_identifier", .{ .string = row.parent_identifier });
+                if (row.parent_url.len > 0) try obj.object.put(var_alloc, "parent_url", .{ .string = row.parent_url });
                 if (row.sub_issue_identifiers.len > 0) {
                     var subs = std.json.Array.init(var_alloc);
                     var iter = std.mem.splitSequence(u8, row.sub_issue_identifiers, ", ");
@@ -504,45 +653,45 @@ pub fn run(ctx: Context) !u8 {
                         if (entry.len == 0) continue;
                         try subs.append(.{ .string = entry });
                     }
-                    try obj.object.put("sub_issue_identifiers", .{ .array = subs });
+                    try obj.object.put(var_alloc, "sub_issue_identifiers", .{ .array = subs });
                 }
-                if (row.project.len > 0) try obj.object.put("project", .{ .string = row.project });
-                if (row.milestone.len > 0) try obj.object.put("milestone", .{ .string = row.milestone });
+                if (row.project.len > 0) try obj.object.put(var_alloc, "project", .{ .string = row.project });
+                if (row.milestone.len > 0) try obj.object.put(var_alloc, "milestone", .{ .string = row.milestone });
                 if (row.created_raw.len > 0) {
-                    try obj.object.put("created_at", .{ .string = row.created_raw });
+                    try obj.object.put(var_alloc, "created_at", .{ .string = row.created_raw });
                 }
-                try obj.object.put("updated_at", .{ .string = row.updated_raw });
-                try obj.object.put("url", .{ .string = row.url });
+                try obj.object.put(var_alloc, "updated_at", .{ .string = row.updated_raw });
+                try obj.object.put(var_alloc, "url", .{ .string = row.url });
                 try out_array.append(obj);
             }
-            var root_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-            try root_obj.object.put("nodes", .{ .array = out_array });
+            var root_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try root_obj.object.put(var_alloc, "nodes", .{ .array = out_array });
 
-            var page_info_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-            try page_info_obj.object.put("hasNextPage", .{ .bool = more_available });
+            var page_info_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try page_info_obj.object.put(var_alloc, "hasNextPage", .{ .bool = more_available });
             if (last_end_cursor) |cursor_value| {
-                try page_info_obj.object.put("endCursor", .{ .string = cursor_value });
+                try page_info_obj.object.put(var_alloc, "endCursor", .{ .string = cursor_value });
             }
-            try root_obj.object.put("pageInfo", page_info_obj);
+            try root_obj.object.put(var_alloc, "pageInfo", page_info_obj);
             const limit_value: i64 = @intCast(page_size);
-            try root_obj.object.put("limit", .{ .integer = limit_value });
+            try root_obj.object.put(var_alloc, "limit", .{ .integer = limit_value });
             if (opts.max_items) |max_value| {
                 const max_i64: i64 = std.math.cast(i64, max_value) orelse limit_value;
-                try root_obj.object.put("maxItems", .{ .integer = max_i64 });
+                try root_obj.object.put(var_alloc, "maxItems", .{ .integer = max_i64 });
             }
             if (opts.sort) |sort_value| {
-                var sort_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-                const sort_field = switch (sort_value.field) {
-                    .created => "createdAt",
-                    .updated => "updatedAt",
-                };
+                var sort_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+                const sort_field = sort_value.field.graphqlName();
                 const sort_dir = switch (sort_value.direction) {
                     .asc => "asc",
                     .desc => "desc",
                 };
-                try sort_obj.object.put("field", .{ .string = sort_field });
-                try sort_obj.object.put("direction", .{ .string = sort_dir });
-                try root_obj.object.put("sort", sort_obj);
+                try sort_obj.object.put(var_alloc, "field", .{ .string = sort_field });
+                try sort_obj.object.put(var_alloc, "direction", .{ .string = sort_dir });
+                if (opts.sort_nulls) |nulls| {
+                    try sort_obj.object.put(var_alloc, "nulls", .{ .string = nulls.wireName() });
+                }
+                try root_obj.object.put(var_alloc, "sort", sort_obj);
             }
             try printer.printJson(root_obj, &out_writer.interface, true);
         } else {
@@ -573,64 +722,56 @@ pub fn run(ctx: Context) !u8 {
         var nodes_value = std.json.Value{ .array = std.json.Array.init(var_alloc) };
         try nodes_value.array.appendSlice(nodes_accumulator.items);
 
-        var page_info_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-        try page_info_obj.object.put("hasNextPage", .{ .bool = more_available });
+        var page_info_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try page_info_obj.object.put(var_alloc, "hasNextPage", .{ .bool = more_available });
         if (last_end_cursor) |cursor_value| {
-            try page_info_obj.object.put("endCursor", .{ .string = cursor_value });
+            try page_info_obj.object.put(var_alloc, "endCursor", .{ .string = cursor_value });
         }
 
-        var issues_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-        try issues_obj.object.put("nodes", nodes_value);
-        try issues_obj.object.put("pageInfo", page_info_obj);
+        var issues_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try issues_obj.object.put(var_alloc, "nodes", nodes_value);
+        try issues_obj.object.put(var_alloc, "pageInfo", page_info_obj);
 
-        var root_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-        try root_obj.object.put("issues", issues_obj);
-        try root_obj.object.put("pageInfo", page_info_obj);
+        var root_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try root_obj.object.put(var_alloc, "issues", issues_obj);
+        try root_obj.object.put(var_alloc, "pageInfo", page_info_obj);
         const limit_value: i64 = @intCast(page_size);
-        try root_obj.object.put("limit", .{ .integer = limit_value });
+        try root_obj.object.put(var_alloc, "limit", .{ .integer = limit_value });
         if (opts.max_items) |max_value| {
             const max_i64: i64 = std.math.cast(i64, max_value) orelse limit_value;
-            try root_obj.object.put("maxItems", .{ .integer = max_i64 });
+            try root_obj.object.put(var_alloc, "maxItems", .{ .integer = max_i64 });
         }
         if (opts.sort) |sort_value| {
-            var sort_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-            const sort_field = switch (sort_value.field) {
-                .created => "createdAt",
-                .updated => "updatedAt",
-            };
+            var sort_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+            const sort_field = sort_value.field.graphqlName();
             const sort_dir = switch (sort_value.direction) {
                 .asc => "asc",
                 .desc => "desc",
             };
-            try sort_obj.object.put("field", .{ .string = sort_field });
-            try sort_obj.object.put("direction", .{ .string = sort_dir });
-            try root_obj.object.put("sort", sort_obj);
+            try sort_obj.object.put(var_alloc, "field", .{ .string = sort_field });
+            try sort_obj.object.put(var_alloc, "direction", .{ .string = sort_dir });
+            if (opts.sort_nulls) |nulls| {
+                try sort_obj.object.put(var_alloc, "nulls", .{ .string = nulls.wireName() });
+            }
+            try root_obj.object.put(var_alloc, "sort", sort_obj);
         }
 
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printJson(root_obj, &out_writer.interface, true);
     } else {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printIssueTable(ctx.allocator, &out_writer.interface, rows.items, selected_fields, table_opts);
     }
 
-    if (!ctx.json_output) {
-        const plural = if (page_count == 1) "" else "s";
-        if (more_available) {
-            const cursor_value = last_end_cursor orelse "(unknown)";
-            try stderr.print(
-                "issues list: fetched {d} items across {d} page{s}; more available, resume with --cursor {s}\n",
-                .{ total_fetched, page_count, plural, cursor_value },
-            );
-        } else {
-            try stderr.print("issues list: fetched {d} items across {d} page{s}\n", .{ total_fetched, page_count, plural });
-        }
-    }
-    if (max_items_reached and opts.max_items != null) {
-        try stderr.print("issues list: stopped after {d} items due to --max-items\n", .{total_fetched});
-    }
+    try common.printPageSummary(stderr, "issues list", .{
+        .items = total_fetched,
+        .pages = page_count,
+        .more_available = more_available,
+        .end_cursor = last_end_cursor,
+        .max_items_reached = max_items_reached,
+    }, ctx.json_output);
     if (sub_truncated and sub_enabled) {
         try stderr.print("issues list: sub-issues limited to {d}; additional sub-issues omitted\n", .{opts.sub_limit});
     }
@@ -648,15 +789,15 @@ fn validateTeamSelection(
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var filter = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    var eq_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try eq_obj.object.put("eq", .{ .string = team_value });
+    var filter = std.json.Value{ .object = std.json.ObjectMap.empty };
+    var eq_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try eq_obj.object.put(var_alloc, "eq", .{ .string = team_value });
     const filter_key = if (isUuid(team_value)) "id" else "key";
-    try filter.object.put(filter_key, eq_obj);
+    try filter.object.put(var_alloc, filter_key, eq_obj);
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("filter", filter);
-    try variables.object.put("first", .{ .integer = 1 });
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "filter", filter);
+    try variables.object.put(var_alloc, "first", .{ .integer = 1 });
 
     const query =
         \\query TeamLookup($filter: TeamFilter, $first: Int!) {
@@ -675,7 +816,7 @@ fn validateTeamSelection(
     };
     defer response.deinit();
 
-    common.checkResponse("issues list", &response, stderr, client.api_key) catch {
+    common.checkResponse(ctx.io, "issues list", &response, stderr, client.api_key) catch {
         return common.CommandError.CommandFailed;
     };
 
@@ -715,25 +856,25 @@ fn buildVariables(
 ) !std.json.Value {
     const page_size_i64 = std.math.cast(i64, page_size) orelse return error.InvalidLimit;
 
-    var vars = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-    try vars.object.put("first", .{ .integer = page_size_i64 });
+    var vars = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try vars.object.put(allocator, "first", .{ .integer = page_size_i64 });
     if (sub_limit) |limit_value| {
         const limit_i64 = std.math.cast(i64, limit_value) orelse return error.InvalidLimit;
-        try vars.object.put("subLimit", .{ .integer = limit_i64 });
+        try vars.object.put(allocator, "subLimit", .{ .integer = limit_i64 });
     }
 
-    var filter = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-    var team_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-    var eq_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-    try eq_obj.object.put("eq", .{ .string = team });
+    var filter = std.json.Value{ .object = std.json.ObjectMap.empty };
+    var team_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+    var eq_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try eq_obj.object.put(allocator, "eq", .{ .string = team });
     if (isUuid(team)) {
-        try team_obj.object.put("id", eq_obj);
+        try team_obj.object.put(allocator, "id", eq_obj);
     } else {
-        try team_obj.object.put("key", eq_obj);
+        try team_obj.object.put(allocator, "key", eq_obj);
     }
-    try filter.object.put("team", team_obj);
+    try filter.object.put(allocator, "team", team_obj);
 
-    var state_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
+    var state_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
     const has_state_type = opts.state_type != null;
     const has_state_id = opts.state_id != null;
     if (has_state_type) {
@@ -741,17 +882,17 @@ fn buildVariables(
             error.EmptyList => return error.InvalidStateFilter,
             else => return err,
         };
-        var state_type_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try state_type_obj.object.put("in", .{ .array = state_values });
-        try state_obj.object.put("type", state_type_obj);
+        var state_type_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try state_type_obj.object.put(allocator, "in", .{ .array = state_values });
+        try state_obj.object.put(allocator, "type", state_type_obj);
     } else if (!has_state_id) {
         var state_values = std.json.Array.init(allocator);
         for (default_state_filter) |entry| {
             try state_values.append(.{ .string = entry });
         }
-        var state_type_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try state_type_obj.object.put("nin", .{ .array = state_values });
-        try state_obj.object.put("type", state_type_obj);
+        var state_type_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try state_type_obj.object.put(allocator, "nin", .{ .array = state_values });
+        try state_obj.object.put(allocator, "type", state_type_obj);
     }
 
     if (has_state_id) {
@@ -759,23 +900,23 @@ fn buildVariables(
             error.EmptyList => return error.InvalidStateIdFilter,
             else => return err,
         };
-        var state_id_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try state_id_obj.object.put("in", .{ .array = state_ids });
-        try state_obj.object.put("id", state_id_obj);
+        var state_id_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try state_id_obj.object.put(allocator, "in", .{ .array = state_ids });
+        try state_obj.object.put(allocator, "id", state_id_obj);
     }
 
-    try filter.object.put("state", state_obj);
+    try filter.object.put(allocator, "state", state_obj);
 
     if (opts.assignee) |assignee_value| {
         const trimmed = std.mem.trim(u8, assignee_value, " \t");
         if (trimmed.len == 0) return error.InvalidAssigneeFilter;
 
-        var id_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try id_obj.object.put("eq", .{ .string = trimmed });
+        var id_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try id_obj.object.put(allocator, "eq", .{ .string = trimmed });
 
-        var assignee_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try assignee_obj.object.put("id", id_obj);
-        try filter.object.put("assignee", assignee_obj);
+        var assignee_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try assignee_obj.object.put(allocator, "id", id_obj);
+        try filter.object.put(allocator, "assignee", assignee_obj);
     }
 
     if (opts.label) |label_value| {
@@ -783,82 +924,89 @@ fn buildVariables(
             error.EmptyList => return error.InvalidLabelFilter,
             else => return err,
         };
-        var id_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try id_obj.object.put("in", .{ .array = label_ids });
+        var id_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try id_obj.object.put(allocator, "in", .{ .array = label_ids });
 
-        var label_filter = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try label_filter.object.put("id", id_obj);
+        var label_filter = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try label_filter.object.put(allocator, "id", id_obj);
 
-        var labels_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try labels_obj.object.put("some", label_filter);
-        try filter.object.put("labels", labels_obj);
+        var labels_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try labels_obj.object.put(allocator, "some", label_filter);
+        try filter.object.put(allocator, "labels", labels_obj);
     }
 
     if (opts.updated_since) |updated_value| {
         const trimmed = std.mem.trim(u8, updated_value, " \t");
         if (trimmed.len == 0) return error.InvalidUpdatedSinceFilter;
 
-        var updated_cmp = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try updated_cmp.object.put("gt", .{ .string = trimmed });
-        try filter.object.put("updatedAt", updated_cmp);
+        var updated_cmp = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try updated_cmp.object.put(allocator, "gt", .{ .string = trimmed });
+        try filter.object.put(allocator, "updatedAt", updated_cmp);
     }
 
     if (opts.created_since) |created_value| {
         const trimmed = std.mem.trim(u8, created_value, " \t");
         if (trimmed.len == 0) return error.InvalidCreatedSinceFilter;
 
-        var created_cmp = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try created_cmp.object.put("gt", .{ .string = trimmed });
-        try filter.object.put("createdAt", created_cmp);
+        var created_cmp = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try created_cmp.object.put(allocator, "gt", .{ .string = trimmed });
+        try filter.object.put(allocator, "createdAt", created_cmp);
     }
 
     if (opts.project) |project_value| {
         const trimmed = std.mem.trim(u8, project_value, " \t");
         if (trimmed.len == 0) return error.InvalidProjectFilter;
 
-        var id_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try id_obj.object.put("eq", .{ .string = trimmed });
+        var id_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try id_obj.object.put(allocator, "eq", .{ .string = trimmed });
 
-        var project_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try project_obj.object.put("id", id_obj);
-        try filter.object.put("project", project_obj);
+        var project_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try project_obj.object.put(allocator, "id", id_obj);
+        try filter.object.put(allocator, "project", project_obj);
     }
 
     if (opts.milestone) |milestone_value| {
         const trimmed = std.mem.trim(u8, milestone_value, " \t");
         if (trimmed.len == 0) return error.InvalidMilestoneFilter;
 
-        var id_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try id_obj.object.put("eq", .{ .string = trimmed });
+        var id_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try id_obj.object.put(allocator, "eq", .{ .string = trimmed });
 
-        var milestone_obj = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try milestone_obj.object.put("id", id_obj);
-        try filter.object.put("milestone", milestone_obj);
+        var milestone_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try milestone_obj.object.put(allocator, "id", id_obj);
+        try filter.object.put(allocator, "milestone", milestone_obj);
     }
 
-    try vars.object.put("filter", filter);
-    if (cursor) |cursor_value| try vars.object.put("after", .{ .string = cursor_value });
+    try vars.object.put(allocator, "filter", filter);
+    if (cursor) |cursor_value| try vars.object.put(allocator, "after", .{ .string = cursor_value });
     if (opts.sort) |sort| {
-        const field_name = switch (sort.field) {
-            .created => "createdAt",
-            .updated => "updatedAt",
-        };
+        const field_name = sort.field.graphqlName();
         const order_value = switch (sort.direction) {
             .asc => "Ascending",
             .desc => "Descending",
         };
 
-        var sort_details = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try sort_details.object.put("order", .{ .string = order_value });
+        var sort_details = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try sort_details.object.put(allocator, "order", .{ .string = order_value });
+        // `nulls` sits beside `order` in the same `*Sort` object. Only written
+        // when `--sort-nulls` was given: absent means the server's own default
+        // placement, which is what every invocation predating the flag got.
+        if (opts.sort_nulls) |nulls| {
+            try sort_details.object.put(allocator, "nulls", .{ .string = nulls.wireName() });
+        }
 
-        var sort_entry = std.json.Value{ .object = std.json.ObjectMap.init(allocator) };
-        try sort_entry.object.put(field_name, sort_details);
+        var sort_entry = std.json.Value{ .object = std.json.ObjectMap.empty };
+        try sort_entry.object.put(allocator, field_name, sort_details);
 
         var sort_array = std.json.Array.init(allocator);
         try sort_array.append(sort_entry);
 
-        try vars.object.put("orderBy", .{ .string = field_name });
-        try vars.object.put("sort", .{ .array = sort_array });
+        // Only `sort` is sent. Linear rejects a request carrying both with
+        // "Cannot use both sort and orderBy options", and `sort` is strictly
+        // richer -- IssueSortInput carries the direction, PaginationOrderBy
+        // carries only the field. Leaving $orderBy unset lets the server apply
+        // its default.
+        try vars.object.put(allocator, "sort", .{ .array = sort_array });
     }
     return vars;
 }
@@ -1043,6 +1191,17 @@ pub fn parseOptions(args: []const []const u8) !Options {
             idx += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--sort-nulls")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.sort_nulls = try parseSortNulls(args[idx + 1]);
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--sort-nulls=")) {
+            opts.sort_nulls = try parseSortNulls(arg["--sort-nulls=".len..]);
+            idx += 1;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--limit")) {
             if (idx + 1 >= args.len) return error.MissingValue;
             opts.limit = try std.fmt.parseInt(usize, args[idx + 1], 10);
@@ -1068,11 +1227,13 @@ pub fn parseOptions(args: []const []const u8) !Options {
         if (std.mem.eql(u8, arg, "--sub-limit")) {
             if (idx + 1 >= args.len) return error.MissingValue;
             opts.sub_limit = try std.fmt.parseInt(usize, args[idx + 1], 10);
+            opts.sub_limit_explicit = true;
             idx += 2;
             continue;
         }
         if (std.mem.startsWith(u8, arg, "--sub-limit=")) {
             opts.sub_limit = try std.fmt.parseInt(usize, arg["--sub-limit=".len..], 10);
+            opts.sub_limit_explicit = true;
             idx += 1;
             continue;
         }
@@ -1153,12 +1314,31 @@ pub fn parseOptions(args: []const []const u8) !Options {
     }
     if (opts.limit == 0) return error.InvalidLimit;
     if (opts.all and opts.pages != null) return error.ConflictingPageFlags;
+    // `nulls` only exists inside a sort object, so there is nowhere to put it
+    // without `--sort`. Say so rather than accepting the flag and ignoring it.
+    if (opts.sort_nulls != null and opts.sort == null) return error.SortNullsRequiresSort;
     return opts;
+}
+
+fn printSortVocabulary(writer: anytype) !void {
+    try writer.print("issues list: valid --sort fields: {s}\n", .{sort_field_list});
+    try writer.print(
+        "issues list: aliases created -> createdAt, updated -> updatedAt; optional :asc|:desc suffix (default: desc)\n",
+        .{},
+    );
+}
+
+fn printSortNullsVocabulary(writer: anytype) !void {
+    try writer.print("issues list: valid --sort-nulls values: {s}\n", .{sort_nulls_list});
+    try writer.print(
+        "issues list: --sort-nulls requires --sort; omit it to leave null placement to the server default\n",
+        .{},
+    );
 }
 
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear issues list [--team ID|KEY] [--state-type TYPES] [--state-id IDS] [--assignee USER_ID] [--label IDS] [--project ID] [--milestone ID] [--updated-since TS] [--sort FIELD[:asc|desc]] [--limit N] [--max-items N] [--sub-limit N] [--cursor CURSOR] [--pages N|--all] [--fields LIST] [--include-projects] [--plain] [--no-truncate] [--human-time] [--quiet] [--data-only] [--help]
+        \\Usage: linear issues list [--team ID|KEY] [--state-type TYPES] [--state-id IDS] [--assignee USER_ID] [--label IDS] [--project ID] [--milestone ID] [--updated-since TS] [--created-since TS] [--sort FIELD[:asc|desc]] [--sort-nulls {[nulls_choices]s}] [--limit N] [--max-items N] [--sub-limit N] [--cursor CURSOR] [--pages N|--all] [--fields LIST] [--include-projects] [--plain] [--no-truncate] [--human-time] [--quiet] [--data-only] [--help]
         \\Flags:
         \\  --team ID|KEY         Team id or key (default: config.default_team_id)
         \\  --state-type VALUES   Comma-separated state types: triage,backlog,unstarted,started,completed,canceled
@@ -1171,10 +1351,16 @@ pub fn usage(writer: anytype) !void {
         \\  --milestone ID        Filter by milestone id
         \\  --updated-since TS    Only include issues updated after the timestamp
         \\  --created-since TS    Only include issues created after the timestamp
-        \\  --sort FIELD[:DIR]    Sort by created|updated (dir asc|desc, default: desc)
+        \\  --sort FIELD[:DIR]    Sort by an IssueSortInput field (dir asc|desc, default: desc)
+        \\                        Fields: {[fields]s}
+        \\                        Aliases: created -> createdAt, updated -> updatedAt
+        \\  --sort-nulls WHERE    Where issues with no value for the --sort field go: {[nulls_list]s}
+        \\                        Requires --sort. Omitted, null placement is left to the
+        \\                        server default (nothing is sent)
         \\  --limit N             Page size per request (default: 25)
         \\  --max-items N         Stop after emitting N issues (may truncate within a page)
-        \\  --sub-limit N         Sub-issues to fetch per parent (0 disables sub-issues; default: 10)
+        \\  --sub-limit N         Sub-issues to fetch per parent; also opts into fetching them
+        \\                        (0 disables; default: 10, only used with --fields sub_issues)
         \\  --cursor CURSOR       Start pagination after the provided cursor
         \\  --pages N             Fetch up to N pages (default: 1)
         \\  --all                 Fetch all pages until the end
@@ -1188,9 +1374,15 @@ pub fn usage(writer: anytype) !void {
         \\  --help                Show this help message
         \\Examples:
         \\  linear issues list --team ENG --pages 2 --limit 50 --sort updated:desc
+        \\  linear issues list --team ENG --sort priority:asc --state-type started
+        \\  linear issues list --team ENG --sort dueDate:asc --sort-nulls last --limit 20
         \\  linear issues list --state-type todo,in_progress --label lbl-1,lbl-2 --assignee user-123
         \\
-    , .{});
+    , .{
+        .fields = sort_field_help,
+        .nulls_choices = sort_nulls_choices,
+        .nulls_list = sort_nulls_list,
+    });
 }
 
 fn parseSort(raw: []const u8) !Sort {
@@ -1199,12 +1391,7 @@ fn parseSort(raw: []const u8) !Sort {
     const field_name = std.mem.trim(u8, field_raw, " \t");
     if (field_name.len == 0) return error.InvalidSort;
 
-    const field = if (std.ascii.eqlIgnoreCase(field_name, "created") or std.ascii.eqlIgnoreCase(field_name, "createdAt"))
-        SortField.created
-    else if (std.ascii.eqlIgnoreCase(field_name, "updated") or std.ascii.eqlIgnoreCase(field_name, "updatedAt"))
-        SortField.updated
-    else
-        return error.InvalidSort;
+    const field = parseSortField(field_name) orelse return error.InvalidSort;
 
     var direction: SortDirection = .desc;
     if (parts.next()) |dir_raw| {
@@ -1226,13 +1413,38 @@ fn parseSort(raw: []const u8) !Sort {
     };
 }
 
+/// Resolves a user-supplied `--sort-nulls` value. Matched case-insensitively
+/// like every other enum-valued flag; the resolved value is always emitted in
+/// the schema's lowercase spelling.
+fn parseSortNulls(raw: []const u8) !SortNulls {
+    const value = std.mem.trim(u8, raw, " \t");
+    if (value.len == 0) return error.InvalidSortNulls;
+    for (std.enums.values(SortNulls)) |candidate| {
+        if (std.ascii.eqlIgnoreCase(value, candidate.wireName())) return candidate;
+    }
+    return error.InvalidSortNulls;
+}
+
+/// Resolves a user-supplied `--sort` field name. The vocabulary is the schema's
+/// own, matched case-insensitively, plus the two short aliases the flag was
+/// first documented with. Unknown names are rejected here rather than by the
+/// API, so a typo costs no request.
+fn parseSortField(name: []const u8) ?SortField {
+    for (std.enums.values(SortField)) |candidate| {
+        if (std.ascii.eqlIgnoreCase(name, candidate.graphqlName())) return candidate;
+    }
+    if (std.ascii.eqlIgnoreCase(name, "created")) return .created;
+    if (std.ascii.eqlIgnoreCase(name, "updated")) return .updated;
+    return null;
+}
+
 fn parseIssueFields(raw: ?[]const u8, buffer: *std.ArrayListUnmanaged(printer.IssueField), allocator: Allocator) ![]const printer.IssueField {
     if (raw) |value| {
         var iter = std.mem.tokenizeScalar(u8, value, ',');
         while (iter.next()) |field_raw| {
             const trimmed = std.mem.trim(u8, field_raw, " \t");
             if (trimmed.len == 0) continue;
-            const field = parseIssueFieldName(trimmed) orelse return error.InvalidField;
+            const field = printer.parseIssueField(trimmed) orelse return error.InvalidField;
             if (!containsIssueField(buffer.items, field)) {
                 try buffer.append(allocator, field);
             }
@@ -1242,20 +1454,6 @@ fn parseIssueFields(raw: ?[]const u8, buffer: *std.ArrayListUnmanaged(printer.Is
     }
     try buffer.appendSlice(allocator, printer.issue_default_fields[0..]);
     return buffer.items;
-}
-
-fn parseIssueFieldName(name: []const u8) ?printer.IssueField {
-    if (std.ascii.eqlIgnoreCase(name, "identifier") or std.ascii.eqlIgnoreCase(name, "id")) return .identifier;
-    if (std.ascii.eqlIgnoreCase(name, "title")) return .title;
-    if (std.ascii.eqlIgnoreCase(name, "state")) return .state;
-    if (std.ascii.eqlIgnoreCase(name, "assignee")) return .assignee;
-    if (std.ascii.eqlIgnoreCase(name, "priority")) return .priority;
-    if (std.ascii.eqlIgnoreCase(name, "parent")) return .parent;
-    if (std.ascii.eqlIgnoreCase(name, "sub_issues") or std.ascii.eqlIgnoreCase(name, "subIssues")) return .sub_issues;
-    if (std.ascii.eqlIgnoreCase(name, "project")) return .project;
-    if (std.ascii.eqlIgnoreCase(name, "milestone")) return .milestone;
-    if (std.ascii.eqlIgnoreCase(name, "updated") or std.ascii.eqlIgnoreCase(name, "updatedAt")) return .updated;
-    return null;
 }
 
 fn containsIssueField(haystack: []const printer.IssueField, needle: printer.IssueField) bool {

@@ -3,7 +3,7 @@
     .rules = .{
         // Struct literal style (T{} vs .{}) - codebase uses explicit style
         .Z004 = .{ .enabled = false },
-        // ArrayListUnmanaged and GeneralPurposeAllocator are still valid in Zig 0.15
+        // ArrayListUnmanaged is still valid in Zig 0.16
         .Z011 = .{ .enabled = false },
         // Nested pub const types incorrectly flagged as private
         .Z012 = .{ .enabled = false },

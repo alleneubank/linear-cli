@@ -3,17 +3,23 @@ const config = @import("config");
 const graphql = @import("graphql");
 const printer = @import("printer");
 const common = @import("common");
+const git = @import("git");
 
 const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
     retries: u8,
     timeout_ms: u32,
     endpoint: ?[]const u8 = null,
+    /// `null` disables branch inference for a missing source identifier, and
+    /// with it every subprocess this command could start. `main.zig` installs
+    /// `git.system_runner`; tests inject a fake.
+    git_runner: ?git.Runner = null,
 };
 
 const RelationType = enum {
@@ -35,7 +41,7 @@ const Options = struct {
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseOptions(ctx.args) catch |err| {
         try stderr.print("issue link: {s}\n", .{@errorName(err)});
@@ -45,14 +51,22 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try usage(&out_writer.interface);
         return 0;
     }
 
-    const source_id = opts.identifier orelse {
-        try stderr.print("issue link: missing source identifier\n", .{});
-        return 1;
+    var inferred: ?[]u8 = null;
+    defer if (inferred) |value| ctx.allocator.free(value);
+    const source_id = opts.identifier orelse blk: {
+        const runner = ctx.git_runner orelse {
+            try stderr.print("issue link: missing source identifier\n", .{});
+            return 1;
+        };
+        inferred = git.requireInferredIdentifier(runner, ctx.allocator, ctx.io, stderr, "issue link") catch {
+            return 1;
+        };
+        break :blk inferred.?;
     };
 
     // Determine relation type and target
@@ -89,7 +103,7 @@ pub fn run(ctx: Context) !u8 {
         return 1;
     };
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -120,13 +134,13 @@ pub fn run(ctx: Context) !u8 {
         .duplicate => "duplicate",
     };
 
-    var input = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try input.object.put("issueId", .{ .string = source_resolved.value });
-    try input.object.put("relatedIssueId", .{ .string = target_resolved.value });
-    try input.object.put("type", .{ .string = relation_type_str });
+    var input = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try input.object.put(var_alloc, "issueId", .{ .string = source_resolved.value });
+    try input.object.put(var_alloc, "relatedIssueId", .{ .string = target_resolved.value });
+    try input.object.put(var_alloc, "type", .{ .string = relation_type_str });
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("input", input);
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "input", input);
 
     const mutation =
         \\mutation IssueRelationCreate($input: IssueRelationCreateInput!) {
@@ -151,7 +165,7 @@ pub fn run(ctx: Context) !u8 {
     };
     defer response.deinit();
 
-    common.checkResponse("issue link", &response, stderr, api_key) catch {
+    common.checkResponse(ctx.io, "issue link", &response, stderr, api_key) catch {
         return 1;
     };
 
@@ -192,7 +206,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (ctx.json_output and !opts.quiet and !opts.data_only) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printJson(data_value, &out_writer.interface, true);
         return 0;
     }
@@ -205,7 +219,7 @@ pub fn run(ctx: Context) !u8 {
     const target_identifier = if (related_obj) |r| common.getStringField(r, "identifier") else null;
 
     var out_buf: [0]u8 = undefined;
-    var out_writer = std.fs.File.stdout().writer(&out_buf);
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     var stdout_iface = &out_writer.interface;
 
     if (opts.quiet) {
@@ -232,9 +246,9 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.data_only) {
         if (ctx.json_output) {
-            var data_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+            var data_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
             for (data_pairs) |pair| {
-                try data_obj.object.put(pair.key, .{ .string = pair.value });
+                try data_obj.object.put(var_alloc, pair.key, .{ .string = pair.value });
             }
             try printer.printJson(data_obj, stdout_iface, true);
             return 0;
@@ -319,7 +333,8 @@ pub fn parseOptions(args: []const []const u8) !Options {
 
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear issue link <ID|IDENTIFIER> --blocks|--related|--duplicate <OTHER_ID> [--yes] [--quiet] [--data-only] [--help]
+        \\Usage: linear issue link [ID|IDENTIFIER] --blocks|--related|--duplicate <OTHER_ID> [--yes] [--quiet] [--data-only] [--help]
+        \\Without a source identifier the issue is inferred from the current branch name.
         \\Flags:
         \\  --blocks OTHER_ID      This issue blocks the other issue
         \\  --related OTHER_ID     General relation between issues

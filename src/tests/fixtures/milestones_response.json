@@ -1,0 +1,36 @@
+{
+  "data": {
+    "projectMilestones": {
+      "nodes": [
+        {
+          "id": "ms-1",
+          "name": "Alpha",
+          "description": "First cut",
+          "targetDate": "2026-08-15",
+          "sortOrder": 1,
+          "project": { "id": "project-1", "name": "Roadmap" }
+        },
+        {
+          "id": "ms-2",
+          "name": "Beta",
+          "description": "Feature complete",
+          "targetDate": "2026-09-30",
+          "sortOrder": 2.5,
+          "project": { "id": "project-1", "name": "Roadmap" }
+        },
+        {
+          "id": "ms-3",
+          "name": "GA",
+          "description": null,
+          "targetDate": null,
+          "sortOrder": 3,
+          "project": { "id": "project-1", "name": "Roadmap" }
+        }
+      ],
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "cursor-ms-3"
+      }
+    }
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "data": {
+    "issueLabels": {
+      "nodes": [
+        {
+          "id": "label-1",
+          "name": "bug",
+          "color": "#eb5757",
+          "description": "Something is broken",
+          "team": { "key": "ENG" }
+        },
+        {
+          "id": "label-2",
+          "name": "feature",
+          "color": "#26b5ce",
+          "description": "New capability",
+          "team": { "key": "ENG" }
+        },
+        {
+          "id": "label-3",
+          "name": "needs-triage",
+          "color": "#f2c94c",
+          "description": null,
+          "team": null
+        }
+      ],
+      "pageInfo": {
+        "hasNextPage": false,
+        "endCursor": "cursor-label-3"
+      }
+    }
+  }
+}

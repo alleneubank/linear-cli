@@ -1,0 +1,21 @@
+{
+  "data": {
+    "issue": {
+      "id": "issue-start-1",
+      "identifier": "ENG-321",
+      "title": "Ship the git integration",
+      "url": "https://linear.app/acme/issue/ENG-321/ship-the-git-integration",
+      "branchName": "erick/eng-321-ship-the-git-integration",
+      "state": { "id": "state-progress", "name": "In Progress", "type": "started" },
+      "team": {
+        "id": "team-1",
+        "states": {
+          "nodes": [
+            { "id": "state-backlog", "name": "Backlog", "type": "backlog", "position": 0 },
+            { "id": "state-progress", "name": "In Progress", "type": "started", "position": 1 }
+          ]
+        }
+      }
+    }
+  }
+}

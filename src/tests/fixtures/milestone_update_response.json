@@ -1,0 +1,15 @@
+{
+  "data": {
+    "projectMilestoneUpdate": {
+      "success": true,
+      "projectMilestone": {
+        "id": "ms-2",
+        "name": "Beta",
+        "targetDate": "2026-10-15",
+        "sortOrder": 2.5,
+        "project": { "id": "project-1", "name": "Roadmap" }
+      },
+      "lastSyncId": 43
+    }
+  }
+}

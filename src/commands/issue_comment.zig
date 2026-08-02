@@ -3,23 +3,30 @@ const config = @import("config");
 const graphql = @import("graphql");
 const printer = @import("printer");
 const common = @import("common");
+const git = @import("git");
 
 const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
     retries: u8,
     timeout_ms: u32,
     endpoint: ?[]const u8 = null,
+    /// `null` disables branch inference for a missing identifier, and with it
+    /// every subprocess this command could start. `main.zig` installs
+    /// `git.system_runner`; tests inject a fake.
+    git_runner: ?git.Runner = null,
 };
 
 const Options = struct {
     identifier: ?[]const u8 = null,
     body: ?[]const u8 = null,
     body_file: ?[]const u8 = null,
+    parent: ?[]const u8 = null,
     yes: bool = false,
     help: bool = false,
     quiet: bool = false,
@@ -28,7 +35,7 @@ const Options = struct {
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseOptions(ctx.args) catch |err| {
         try stderr.print("issue comment: {s}\n", .{@errorName(err)});
@@ -38,14 +45,22 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try usage(&out_writer.interface);
         return 0;
     }
 
-    const target = opts.identifier orelse {
-        try stderr.print("issue comment: missing issue identifier\n", .{});
-        return 1;
+    var inferred: ?[]u8 = null;
+    defer if (inferred) |value| ctx.allocator.free(value);
+    const target = opts.identifier orelse blk: {
+        const runner = ctx.git_runner orelse {
+            try stderr.print("issue comment: missing issue identifier\n", .{});
+            return 1;
+        };
+        inferred = git.requireInferredIdentifier(runner, ctx.allocator, ctx.io, stderr, "issue comment") catch {
+            return 1;
+        };
+        break :blk inferred.?;
     };
 
     if (opts.body == null and opts.body_file == null) {
@@ -53,8 +68,24 @@ pub fn run(ctx: Context) !u8 {
         return 1;
     }
 
-    if (opts.body != null and opts.body_file != null) {
-        try stderr.print("issue comment: cannot use both --body and --body-file\n", .{});
+    // Resolved before any network work so a bad path or an oversize file fails
+    // without touching the API.
+    const body_source = common.resolveContent(
+        ctx.allocator,
+        ctx.io,
+        opts.body,
+        opts.body_file,
+        stderr,
+        "issue comment",
+        "--body",
+    ) catch {
+        return 1;
+    };
+    defer body_source.deinit(ctx.allocator);
+    const body_content = body_source.value orelse "";
+
+    if (body_content.len == 0) {
+        try stderr.print("issue comment: comment body cannot be empty\n", .{});
         return 1;
     }
 
@@ -62,7 +93,7 @@ pub fn run(ctx: Context) !u8 {
         return 1;
     };
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -77,27 +108,20 @@ pub fn run(ctx: Context) !u8 {
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    const body_content = if (opts.body) |body|
-        body
-    else blk: {
-        const content = readBodyFile(ctx.allocator, opts.body_file.?, stderr) catch {
+    var input = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try input.object.put(var_alloc, "issueId", .{ .string = issue_id.value });
+    try input.object.put(var_alloc, "body", .{ .string = body_content });
+    if (opts.parent) |parent_id| {
+        const trimmed = std.mem.trim(u8, parent_id, " \t");
+        if (trimmed.len == 0) {
+            try stderr.print("issue comment: invalid --parent value\n", .{});
             return 1;
-        };
-        break :blk content;
-    };
-    defer if (opts.body_file != null) ctx.allocator.free(body_content);
-
-    if (body_content.len == 0) {
-        try stderr.print("issue comment: comment body cannot be empty\n", .{});
-        return 1;
+        }
+        try input.object.put(var_alloc, "parentId", .{ .string = trimmed });
     }
 
-    var input = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try input.object.put("issueId", .{ .string = issue_id.value });
-    try input.object.put("body", .{ .string = body_content });
-
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("input", input);
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "input", input);
 
     if (!opts.yes) {
         try stderr.print("issue comment: confirmation required; re-run with --yes to proceed\n", .{});
@@ -112,6 +136,9 @@ pub fn run(ctx: Context) !u8 {
         \\      id
         \\      body
         \\      url
+        \\      parent {
+        \\        id
+        \\      }
         \\      issue {
         \\        identifier
         \\      }
@@ -129,7 +156,7 @@ pub fn run(ctx: Context) !u8 {
     };
     defer response.deinit();
 
-    common.checkResponse("issue comment", &response, stderr, api_key) catch {
+    common.checkResponse(ctx.io, "issue comment", &response, stderr, api_key) catch {
         return 1;
     };
 
@@ -171,7 +198,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (ctx.json_output and !opts.quiet and !opts.data_only) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printJson(data_value, &out_writer.interface, true);
         return 0;
     }
@@ -181,9 +208,11 @@ pub fn run(ctx: Context) !u8 {
     const issue_obj = common.getObjectField(comment, "issue");
     const identifier = if (issue_obj) |iss| common.getStringField(iss, "identifier") else null;
     const identifier_value = identifier orelse target;
+    const parent_obj = common.getObjectField(comment, "parent");
+    const parent_id = if (parent_obj) |p| common.getStringField(p, "id") else null;
 
     var out_buf: [0]u8 = undefined;
-    var out_writer = std.fs.File.stdout().writer(&out_buf);
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     var stdout_iface = &out_writer.interface;
 
     if (opts.quiet) {
@@ -192,63 +221,38 @@ pub fn run(ctx: Context) !u8 {
         return 0;
     }
 
-    const pairs = [_]printer.KeyValue{
-        .{ .key = "Issue", .value = identifier_value },
-        .{ .key = "Comment", .value = comment_id },
-        .{ .key = "URL", .value = url },
-    };
-    const data_pairs = [_]printer.KeyValue{
-        .{ .key = "issue", .value = identifier_value },
-        .{ .key = "comment", .value = comment_id },
-        .{ .key = "url", .value = url },
-    };
+    var pairs = std.ArrayListUnmanaged(printer.KeyValue).empty;
+    defer pairs.deinit(ctx.allocator);
+    var data_pairs = std.ArrayListUnmanaged(printer.KeyValue).empty;
+    defer data_pairs.deinit(ctx.allocator);
+
+    try pairs.append(ctx.allocator, .{ .key = "Issue", .value = identifier_value });
+    try data_pairs.append(ctx.allocator, .{ .key = "issue", .value = identifier_value });
+    try pairs.append(ctx.allocator, .{ .key = "Comment", .value = comment_id });
+    try data_pairs.append(ctx.allocator, .{ .key = "comment", .value = comment_id });
+    if (parent_id) |value| {
+        try pairs.append(ctx.allocator, .{ .key = "Parent", .value = value });
+        try data_pairs.append(ctx.allocator, .{ .key = "parent", .value = value });
+    }
+    try pairs.append(ctx.allocator, .{ .key = "URL", .value = url });
+    try data_pairs.append(ctx.allocator, .{ .key = "url", .value = url });
 
     if (opts.data_only) {
         if (ctx.json_output) {
-            var data_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-            for (data_pairs) |pair| {
-                try data_obj.object.put(pair.key, .{ .string = pair.value });
+            var data_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+            for (data_pairs.items) |pair| {
+                try data_obj.object.put(var_alloc, pair.key, .{ .string = pair.value });
             }
             try printer.printJson(data_obj, stdout_iface, true);
             return 0;
         }
 
-        try printer.printKeyValuesPlain(stdout_iface, data_pairs[0..]);
+        try printer.printKeyValuesPlain(stdout_iface, data_pairs.items);
         return 0;
     }
 
-    try printer.printKeyValues(stdout_iface, pairs[0..]);
+    try printer.printKeyValues(stdout_iface, pairs.items);
     return 0;
-}
-
-fn readBodyFile(allocator: Allocator, path: []const u8, stderr: anytype) ![]u8 {
-    if (std.mem.eql(u8, path, "-")) {
-        return readStdin(allocator, stderr);
-    }
-
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-        try stderr.print("issue comment: cannot open file '{s}': {s}\n", .{ path, @errorName(err) });
-        return common.CommandError.CommandFailed;
-    };
-    defer file.close();
-
-    const max_size = 1024 * 1024; // 1MB limit for comment body
-    const content = file.readToEndAlloc(allocator, max_size) catch |err| {
-        try stderr.print("issue comment: cannot read file '{s}': {s}\n", .{ path, @errorName(err) });
-        return common.CommandError.CommandFailed;
-    };
-
-    return content;
-}
-
-fn readStdin(allocator: Allocator, stderr: anytype) ![]u8 {
-    var reader = std.fs.File.stdin().deprecatedReader();
-    const max_size = 1024 * 1024; // 1MB limit for comment body
-    const content = reader.readAllAlloc(allocator, max_size) catch |err| {
-        try stderr.print("issue comment: cannot read from stdin: {s}\n", .{@errorName(err)});
-        return common.CommandError.CommandFailed;
-    };
-    return content;
 }
 
 pub fn parseOptions(args: []const []const u8) !Options {
@@ -293,6 +297,17 @@ pub fn parseOptions(args: []const []const u8) !Options {
             idx += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--parent")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.parent = args[idx + 1];
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--parent=")) {
+            opts.parent = arg["--parent=".len..];
+            idx += 1;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--yes") or std.mem.eql(u8, arg, "--force")) {
             opts.yes = true;
             idx += 1;
@@ -311,11 +326,13 @@ pub fn parseOptions(args: []const []const u8) !Options {
 
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear issue comment <ID|IDENTIFIER> --body TEXT [--yes] [--quiet] [--data-only] [--help]
-        \\       linear issue comment <ID|IDENTIFIER> --body-file PATH [--yes] [--quiet] [--data-only] [--help]
+        \\Usage: linear issue comment [ID|IDENTIFIER] --body TEXT [--parent COMMENT_ID] [--yes] [--quiet] [--data-only] [--help]
+        \\Without an identifier the issue is inferred from the current branch name.
+        \\       linear issue comment <ID|IDENTIFIER> --body-file PATH [--parent COMMENT_ID] [--yes] [--quiet] [--data-only] [--help]
         \\Flags:
         \\  --body TEXT          Comment body text
         \\  --body-file PATH     Read comment body from file (use '-' for stdin)
+        \\  --parent COMMENT_ID  Reply to an existing comment (threaded reply)
         \\  --yes                Skip confirmation prompt (alias: --force)
         \\  --quiet              Print only the comment id
         \\  --data-only          Emit tab-separated fields without formatting (or JSON object with --json)
@@ -324,6 +341,7 @@ pub fn usage(writer: anytype) !void {
         \\  linear issue comment ENG-123 --body "This is a comment" --yes
         \\  linear issue comment ENG-123 --body-file /path/to/comment.md --yes
         \\  cat comment.md | linear issue comment ENG-123 --body-file - --yes
+        \\  linear issue comment ENG-123 --body "Replying" --parent comment-1 --yes
         \\
     , .{});
 }

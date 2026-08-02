@@ -2,17 +2,64 @@ const std = @import("std");
 
 const Allocator = std.mem.Allocator;
 
+pub const default_endpoint = "https://api.linear.app/graphql";
+pub const allowed_endpoint_host = "api.linear.app";
+pub const allow_insecure_endpoint_env = "LINEAR_ALLOW_INSECURE_ENDPOINT";
+
+pub const EndpointError = error{
+    InvalidEndpointUrl,
+    InsecureEndpointScheme,
+    EndpointHostNotAllowed,
+};
+
+/// Every request carries the Authorization header, so the endpoint is checked
+/// against the allowlist before a connection is opened. `LINEAR_ALLOW_INSECURE_ENDPOINT=1`
+/// relaxes the check for the mock/QA workflow only.
+pub fn validateEndpoint(endpoint: []const u8, allow_insecure: bool) EndpointError!void {
+    const uri = std.Uri.parse(endpoint) catch return EndpointError.InvalidEndpointUrl;
+    const host_component = uri.host orelse return EndpointError.InvalidEndpointUrl;
+    const host = switch (host_component) {
+        .raw => |value| value,
+        .percent_encoded => |value| value,
+    };
+    if (host.len == 0) return EndpointError.InvalidEndpointUrl;
+
+    if (allow_insecure) return;
+
+    if (!std.ascii.eqlIgnoreCase(uri.scheme, "https")) return EndpointError.InsecureEndpointScheme;
+    if (!std.ascii.eqlIgnoreCase(host, allowed_endpoint_host)) return EndpointError.EndpointHostNotAllowed;
+}
+
+pub fn endpointErrorMessage(err: EndpointError) []const u8 {
+    return switch (err) {
+        EndpointError.InvalidEndpointUrl => "endpoint must be an absolute URL with a host",
+        EndpointError.InsecureEndpointScheme => "endpoint must use https; set " ++ allow_insecure_endpoint_env ++ "=1 to allow other schemes",
+        EndpointError.EndpointHostNotAllowed => "endpoint host must be " ++ allowed_endpoint_host ++ "; set " ++ allow_insecure_endpoint_env ++ "=1 to allow other hosts",
+    };
+}
+
+pub fn setAllowInsecureEndpoint(enabled: bool) void {
+    allow_insecure_endpoint_preference.store(enabled, .release);
+}
+
+pub fn getAllowInsecureEndpoint() bool {
+    return allow_insecure_endpoint_preference.load(.acquire);
+}
+
 pub const GraphqlClient = struct {
     allocator: Allocator,
+    io: std.Io,
     api_key: []const u8,
-    endpoint: []const u8 = "https://api.linear.app/graphql",
+    endpoint: []const u8 = default_endpoint,
     http_client: *std.http.Client,
     keep_alive: bool,
+    allow_insecure_endpoint: bool,
     timeout_ms: u32 = 10_000,
     max_retries: u8 = 0,
 
     pub const Options = struct {
         keep_alive: ?bool = null,
+        allow_insecure_endpoint: ?bool = null,
     };
 
     pub const Error = error{RequestTimedOut};
@@ -28,24 +75,24 @@ pub const GraphqlClient = struct {
         }
     };
 
-    pub fn init(allocator: Allocator, api_key: []const u8) GraphqlClient {
-        return initWithOptions(allocator, api_key, .{});
+    pub fn init(allocator: Allocator, io: std.Io, api_key: []const u8) GraphqlClient {
+        return initWithOptions(allocator, io, api_key, .{});
     }
 
-    pub fn initWithOptions(allocator: Allocator, api_key: []const u8, options: Options) GraphqlClient {
-        const http_client = shared_client.acquire(allocator);
-        markTlsRefresh(http_client);
+    pub fn initWithOptions(allocator: Allocator, io: std.Io, api_key: []const u8, options: Options) GraphqlClient {
+        const http_client = shared_client.acquire(allocator, io);
         return .{
             .allocator = allocator,
+            .io = io,
             .api_key = api_key,
             .http_client = http_client,
             .keep_alive = options.keep_alive orelse keep_alive_preference.load(.acquire),
+            .allow_insecure_endpoint = options.allow_insecure_endpoint orelse allow_insecure_endpoint_preference.load(.acquire),
         };
     }
 
     pub fn deinit(self: *GraphqlClient) void {
-        _ = self;
-        shared_client.release();
+        shared_client.release(self.io);
     }
 
     pub const Request = struct {
@@ -109,14 +156,14 @@ pub const GraphqlClient = struct {
         const payload_bytes = try buildPayload(allocator, req);
         defer allocator.free(payload_bytes);
 
-        var response_writer = std.io.Writer.Allocating.init(allocator);
+        var response_writer = std.Io.Writer.Allocating.init(allocator);
         defer response_writer.deinit();
 
-        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(std.time.nanoTimestamp())));
+        var prng = std.Random.DefaultPrng.init(@as(u64, @intCast(std.Io.Clock.real.now(self.io).toNanoseconds())));
         var random = prng.random();
         var rate_limit: RateLimitInfo = .{};
 
-        const start_ms: i64 = std.time.milliTimestamp();
+        const start_ms: i64 = std.Io.Clock.real.now(self.io).toMilliseconds();
         const deadline_ms = start_ms + @as(i64, @intCast(self.timeout_ms));
 
         var attempt: u8 = 0;
@@ -124,21 +171,21 @@ pub const GraphqlClient = struct {
         while (true) : (attempt += 1) {
             response_writer.clearRetainingCapacity();
 
-            if (std.time.milliTimestamp() >= deadline_ms) return Error.RequestTimedOut;
+            if (std.Io.Clock.real.now(self.io).toMilliseconds() >= deadline_ms) return Error.RequestTimedOut;
 
             const attempt_result = try performRequest(self, payload_bytes, &response_writer.writer);
             rate_limit = attempt_result.rate_limit;
             const status_code: u16 = attempt_result.status;
 
-            const after_ms: i64 = std.time.milliTimestamp();
+            const after_ms: i64 = std.Io.Clock.real.now(self.io).toMilliseconds();
             if (after_ms >= deadline_ms) return Error.RequestTimedOut;
 
             const can_retry = shouldRetry(status_code) and attempt + 1 < max_attempts;
             if (can_retry) {
                 const remaining_ms = deadline_ms - after_ms;
                 const delay_ms = computeDelayMs(attempt, rate_limit, remaining_ms, &random) orelse return Error.RequestTimedOut;
-                logRetry(status_code, attempt + 2, max_attempts, delay_ms);
-                std.Thread.sleep(delay_ms * std.time.ns_per_ms);
+                logRetry(self.io, status_code, attempt + 2, max_attempts, delay_ms);
+                try self.io.sleep(.fromMilliseconds(@intCast(delay_ms)), .awake);
                 continue;
             }
 
@@ -161,38 +208,39 @@ pub fn getDefaultKeepAlive() bool {
     return keep_alive_preference.load(.acquire);
 }
 
-pub fn deinitSharedClient() void {
-    shared_client.shutdown();
+pub fn deinitSharedClient(io: std.Io) void {
+    shared_client.shutdown(io);
 }
 
 const SharedHttpClient = struct {
-    mutex: std.Thread.Mutex = .{},
+    mutex: std.Io.Mutex = .init,
     ref_count: usize = 0,
     client: ?std.http.Client = null,
 
-    fn acquire(self: *SharedHttpClient, allocator: Allocator) *std.http.Client {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn acquire(self: *SharedHttpClient, allocator: Allocator, io: std.Io) *std.http.Client {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.client == null) {
-            self.client = std.http.Client{ .allocator = allocator };
+            self.client = std.http.Client{ .allocator = allocator, .io = io };
         }
+        markTlsRefresh(&self.client.?);
         self.ref_count += 1;
         return &self.client.?;
     }
 
-    fn release(self: *SharedHttpClient) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn release(self: *SharedHttpClient, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.client == null) return;
         std.debug.assert(self.ref_count > 0);
         self.ref_count -= 1;
     }
 
-    fn shutdown(self: *SharedHttpClient) void {
-        self.mutex.lock();
-        defer self.mutex.unlock();
+    fn shutdown(self: *SharedHttpClient, io: std.Io) void {
+        self.mutex.lockUncancelable(io);
+        defer self.mutex.unlock(io);
 
         if (self.client == null) return;
         std.debug.assert(self.ref_count == 0);
@@ -203,9 +251,12 @@ const SharedHttpClient = struct {
 
 var shared_client: SharedHttpClient = .{};
 var keep_alive_preference = std.atomic.Value(bool).init(true);
+var allow_insecure_endpoint_preference = std.atomic.Value(bool).init(false);
 
+/// Clearing `now` makes the next HTTPS request re-check the clock and rescan
+/// the system root certificates. Callers must hold `SharedHttpClient.mutex`.
 fn markTlsRefresh(client: *std.http.Client) void {
-    @atomicStore(bool, &client.next_https_rescan_certs, true, .release);
+    client.now = null;
 }
 
 fn buildPayload(allocator: Allocator, req: GraphqlClient.Request) ![]u8 {
@@ -232,8 +283,11 @@ const AttemptResult = struct {
 fn performRequest(
     client: *GraphqlClient,
     payload_bytes: []const u8,
-    response_writer: *std.io.Writer,
+    response_writer: *std.Io.Writer,
 ) !AttemptResult {
+    // Last gate before the Authorization header goes on the wire.
+    try validateEndpoint(client.endpoint, client.allow_insecure_endpoint);
+
     var req = try client.http_client.request(.POST, std.Uri.parse(client.endpoint) catch return error.InvalidEndpoint, .{
         .redirect_behavior = .unhandled,
         .keep_alive = client.keep_alive,
@@ -314,9 +368,9 @@ fn computeDelayMs(
     return delay_ms;
 }
 
-fn logRetry(status_code: u16, attempt_number: u8, max_attempts: u8, delay_ms: u64) void {
+fn logRetry(io: std.Io, status_code: u16, attempt_number: u8, max_attempts: u8, delay_ms: u64) void {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buf);
     const stderr = &stderr_writer.interface;
     stderr.print(
         "graphql: retrying after HTTP {d} (attempt {d}/{d}) in {d}ms\n",

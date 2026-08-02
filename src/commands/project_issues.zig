@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
@@ -29,7 +30,7 @@ const Mode = enum { add, remove };
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
 
     if (ctx.args.len == 0) {
@@ -53,7 +54,7 @@ pub fn run(ctx: Context) !u8 {
 
 fn runModify(ctx: Context, mode: Mode, args: [][]const u8) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const prefix = switch (mode) {
         .add => "project add-issue",
@@ -71,7 +72,7 @@ fn runModify(ctx: Context, mode: Mode, args: [][]const u8) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         switch (mode) {
             .add => try addUsage(&out_writer.interface),
             .remove => try removeUsage(&out_writer.interface),
@@ -97,7 +98,7 @@ fn runModify(ctx: Context, mode: Mode, args: [][]const u8) !u8 {
         return 1;
     };
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -112,15 +113,15 @@ fn runModify(ctx: Context, mode: Mode, args: [][]const u8) !u8 {
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var input = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+    var input = std.json.Value{ .object = std.json.ObjectMap.empty };
     switch (mode) {
-        .add => try input.object.put("projectId", .{ .string = resolved.value }),
-        .remove => try input.object.put("projectId", .{ .null = {} }),
+        .add => try input.object.put(var_alloc, "projectId", .{ .string = resolved.value }),
+        .remove => try input.object.put(var_alloc, "projectId", .{ .null = {} }),
     }
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("id", .{ .string = issue_id });
-    try variables.object.put("input", input);
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "id", .{ .string = issue_id });
+    try variables.object.put(var_alloc, "input", input);
 
     const mutation =
         \\mutation IssueUpdate($id: String!, $input: IssueUpdateInput!) {
@@ -140,7 +141,7 @@ fn runModify(ctx: Context, mode: Mode, args: [][]const u8) !u8 {
     };
     defer response.deinit();
 
-    common.checkResponse(prefix, &response, stderr, api_key) catch {
+    common.checkResponse(ctx.io, prefix, &response, stderr, api_key) catch {
         return 1;
     };
 
@@ -181,7 +182,7 @@ fn runModify(ctx: Context, mode: Mode, args: [][]const u8) !u8 {
 
     if (ctx.json_output and !opts.quiet and !opts.data_only) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printJson(data_value, &out_writer.interface, true);
         return 0;
     }
@@ -201,7 +202,7 @@ fn runModify(ctx: Context, mode: Mode, args: [][]const u8) !u8 {
     };
 
     var out_buf: [0]u8 = undefined;
-    var out_writer = std.fs.File.stdout().writer(&out_buf);
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     var stdout_iface = &out_writer.interface;
 
     if (opts.quiet) {
@@ -212,9 +213,9 @@ fn runModify(ctx: Context, mode: Mode, args: [][]const u8) !u8 {
 
     if (opts.data_only) {
         if (ctx.json_output) {
-            var data_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-            try data_obj.object.put("identifier", .{ .string = identifier });
-            try data_obj.object.put("project", .{ .string = project_value });
+            var data_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+            try data_obj.object.put(var_alloc, "identifier", .{ .string = identifier });
+            try data_obj.object.put(var_alloc, "project", .{ .string = project_value });
             try printer.printJson(data_obj, stdout_iface, true);
             return 0;
         }

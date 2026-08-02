@@ -8,6 +8,7 @@ const Allocator = std.mem.Allocator;
 
 pub const Context = struct {
     allocator: Allocator,
+    io: std.Io,
     config: *config.Config,
     args: [][]const u8,
     json_output: bool,
@@ -20,6 +21,7 @@ const Options = struct {
     team: ?[]const u8 = null,
     title: ?[]const u8 = null,
     description: ?[]const u8 = null,
+    description_file: ?[]const u8 = null,
     priority: ?i64 = null,
     state: ?[]const u8 = null,
     assignee: ?[]const u8 = null,
@@ -38,7 +40,7 @@ const ResolvedId = struct {
 
 pub fn run(ctx: Context) !u8 {
     var stderr_buf: [0]u8 = undefined;
-    var stderr_writer = std.fs.File.stderr().writer(&stderr_buf);
+    var stderr_writer = std.Io.File.stderr().writer(ctx.io, &stderr_buf);
     var stderr = &stderr_writer.interface;
     const opts = parseOptions(ctx.args) catch |err| {
         try stderr.print("issue create: {s}\n", .{@errorName(err)});
@@ -48,7 +50,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.help) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try usage(&out_writer.interface);
         return 0;
     }
@@ -62,11 +64,26 @@ pub fn run(ctx: Context) !u8 {
         return 1;
     }
 
+    // Resolved before any network work so a bad path or an oversize file fails
+    // without touching the API.
+    const description_source = common.resolveContent(
+        ctx.allocator,
+        ctx.io,
+        opts.description,
+        opts.description_file,
+        stderr,
+        "issue create",
+        "--description",
+    ) catch {
+        return 1;
+    };
+    defer description_source.deinit(ctx.allocator);
+
     const api_key = common.requireApiKey(ctx.config, null, stderr, "issue create") catch {
         return 1;
     };
 
-    var client = graphql.GraphqlClient.init(ctx.allocator, api_key);
+    var client = graphql.GraphqlClient.init(ctx.allocator, ctx.io, api_key);
     defer client.deinit();
     client.max_retries = ctx.retries;
     client.timeout_ms = ctx.timeout_ms;
@@ -82,20 +99,20 @@ pub fn run(ctx: Context) !u8 {
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var input = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try input.object.put("teamId", .{ .string = team_id.value });
-    try input.object.put("title", .{ .string = opts.title.? });
-    if (opts.description) |desc| {
-        try input.object.put("description", .{ .string = desc });
+    var input = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try input.object.put(var_alloc, "teamId", .{ .string = team_id.value });
+    try input.object.put(var_alloc, "title", .{ .string = opts.title.? });
+    if (description_source.value) |desc| {
+        try input.object.put(var_alloc, "description", .{ .string = desc });
     }
     if (opts.priority) |prio| {
-        try input.object.put("priority", .{ .integer = prio });
+        try input.object.put(var_alloc, "priority", .{ .integer = prio });
     }
     if (opts.state) |state_id| {
-        try input.object.put("stateId", .{ .string = state_id });
+        try input.object.put(var_alloc, "stateId", .{ .string = state_id });
     }
     if (opts.assignee) |assignee_id| {
-        try input.object.put("assigneeId", .{ .string = assignee_id });
+        try input.object.put(var_alloc, "assigneeId", .{ .string = assignee_id });
     }
     if (opts.labels) |labels_value| {
         var label_ids = std.json.Array.init(var_alloc);
@@ -108,15 +125,15 @@ pub fn run(ctx: Context) !u8 {
             added += 1;
         }
         if (added > 0) {
-            try input.object.put("labelIds", .{ .array = label_ids });
+            try input.object.put(var_alloc, "labelIds", .{ .array = label_ids });
         }
     }
     if (opts.project) |project_id| {
-        try input.object.put("projectId", .{ .string = project_id });
+        try input.object.put(var_alloc, "projectId", .{ .string = project_id });
     }
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("input", input);
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "input", input);
 
     if (!opts.yes) {
         try stderr.print("issue create: confirmation required; re-run with --yes to proceed\n", .{});
@@ -147,7 +164,7 @@ pub fn run(ctx: Context) !u8 {
     };
     defer response.deinit();
 
-    common.checkResponse("issue create", &response, stderr, api_key) catch {
+    common.checkResponse(ctx.io, "issue create", &response, stderr, api_key) catch {
         return 1;
     };
 
@@ -189,7 +206,7 @@ pub fn run(ctx: Context) !u8 {
 
     if (ctx.json_output and !opts.quiet and !opts.data_only) {
         var out_buf: [0]u8 = undefined;
-        var out_writer = std.fs.File.stdout().writer(&out_buf);
+        var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
         try printer.printJson(data_value, &out_writer.interface, true);
         return 0;
     }
@@ -210,7 +227,7 @@ pub fn run(ctx: Context) !u8 {
     };
 
     var out_buf: [0]u8 = undefined;
-    var out_writer = std.fs.File.stdout().writer(&out_buf);
+    var out_writer = std.Io.File.stdout().writer(ctx.io, &out_buf);
     var stdout_iface = &out_writer.interface;
 
     if (opts.quiet) {
@@ -221,9 +238,9 @@ pub fn run(ctx: Context) !u8 {
 
     if (opts.data_only) {
         if (ctx.json_output) {
-            var data_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
+            var data_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
             for (data_pairs) |pair| {
-                try data_obj.object.put(pair.key, .{ .string = pair.value });
+                try data_obj.object.put(var_alloc, pair.key, .{ .string = pair.value });
             }
             try printer.printJson(data_obj, stdout_iface, true);
             return 0;
@@ -250,14 +267,14 @@ fn resolveTeamId(ctx: Context, client: *graphql.GraphqlClient, value: []const u8
     defer arena.deinit();
     const var_alloc = arena.allocator();
 
-    var filter = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    var eq_obj = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try eq_obj.object.put("eq", .{ .string = value });
-    try filter.object.put("key", eq_obj);
+    var filter = std.json.Value{ .object = std.json.ObjectMap.empty };
+    var eq_obj = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try eq_obj.object.put(var_alloc, "eq", .{ .string = value });
+    try filter.object.put(var_alloc, "key", eq_obj);
 
-    var variables = std.json.Value{ .object = std.json.ObjectMap.init(var_alloc) };
-    try variables.object.put("filter", filter);
-    try variables.object.put("first", .{ .integer = 1 });
+    var variables = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try variables.object.put(var_alloc, "filter", filter);
+    try variables.object.put(var_alloc, "first", .{ .integer = 1 });
 
     const query =
         \\query TeamLookup($filter: TeamFilter, $first: Int!) {
@@ -276,7 +293,7 @@ fn resolveTeamId(ctx: Context, client: *graphql.GraphqlClient, value: []const u8
     };
     defer response.deinit();
 
-    common.checkResponse("issue create", &response, stderr, client.api_key) catch {
+    common.checkResponse(ctx.io, "issue create", &response, stderr, client.api_key) catch {
         return error.InvalidTeam;
     };
 
@@ -369,6 +386,17 @@ pub fn parseOptions(args: []const []const u8) !Options {
             idx += 1;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--description-file")) {
+            if (idx + 1 >= args.len) return error.MissingValue;
+            opts.description_file = args[idx + 1];
+            idx += 2;
+            continue;
+        }
+        if (std.mem.startsWith(u8, arg, "--description-file=")) {
+            opts.description_file = arg["--description-file=".len..];
+            idx += 1;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "--priority")) {
             if (idx + 1 >= args.len) return error.MissingValue;
             opts.priority = try std.fmt.parseInt(i64, args[idx + 1], 10);
@@ -437,11 +465,12 @@ pub fn parseOptions(args: []const []const u8) !Options {
 
 pub fn usage(writer: anytype) !void {
     try writer.print(
-        \\Usage: linear issue create --team ID|KEY --title TITLE [--description TEXT] [--priority N] [--state STATE_ID] [--assignee USER_ID] [--labels ID,ID] [--project PROJECT_ID] [--yes] [--quiet] [--data-only] [--help]
+        \\Usage: linear issue create --team ID|KEY --title TITLE [--description TEXT|--description-file PATH] [--priority N] [--state STATE_ID] [--assignee USER_ID] [--labels ID,ID] [--project PROJECT_ID] [--yes] [--quiet] [--data-only] [--help]
         \\Flags:
         \\  --team ID|KEY        Team id or key (required)
         \\  --title TITLE        Issue title (required)
         \\  --description TEXT   Issue description
+        \\  --description-file PATH  Read the description from a file (use '-' for stdin)
         \\  --priority N         Priority number
         \\  --state STATE_ID     State id to apply
         \\  --assignee USER_ID   Assignee id
@@ -454,6 +483,8 @@ pub fn usage(writer: anytype) !void {
         \\Examples:
         \\  linear issue create --team ENG --title \"Fix bug\" --priority 2
         \\  linear issue create --team ENG --title \"API error\" --labels abc,def --quiet
+        \\  linear issue create --team ENG --title \"Imported\" --description-file body.md --yes
+        \\  cat body.md | linear issue create --team ENG --title \"Imported\" --description-file - --yes
         \\
     , .{});
 }
